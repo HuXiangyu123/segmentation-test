@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Data and Cache
+dataset/
+cache_bone_tumor/
+*.nii
+*.nii.gz
+*.dcm
+
+# Model checkpoints (keep only best and final)
+MulModSeg_2024/out/**/epoch_*.pt
+!MulModSeg_2024/out/**/best_model.pt
+!MulModSeg_2024/out/**/final_model.pt
+*.pt
+*.pth
+# Temporary and test outputs
+**/smoke_test_*/
+**/test_*/
+**/debug_*/
+diagnosis_output/
+diagnosis_*.log
+
+# TensorBoard
+events.out.tfevents.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Large files
+*.tar
+*.tar.gz
+*.zip
+*.rar
+
+# Docs & IDE metadata (not needed in repo)
+docs/
+.claude/
+.cursor/
+output/
+templates/

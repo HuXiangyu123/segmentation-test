@@ -1,0 +1,201 @@
+# Experiment Configuration for Bone Tumor Segmentation
+# 骨肿瘤分割实验配置
+
+# Common settings shared across all experiments
+common:
+  # Dataset
+  dataset: bone_tumor
+  data_root_path: /home/glcuser/projhighcv/bone_tumor
+
+  # Model
+  backbone: unet
+  with_text_embedding: 1
+  num_class: 2
+
+  # Training
+  train_modality: MIX
+  max_epoch: 20
+  batch_size: 2
+  num_workers: 8
+
+  # Optimization
+  lr: 1.0e-4
+  warmup_epoch: 2
+
+  # Reproducibility
+  seed: 42
+
+  # Hardware
+  device: 0
+
+  # ROI size
+  roi_x: 96
+  roi_y: 96
+  roi_z: 96
+
+# Experiment-specific configurations
+experiments:
+  E0_baseline:
+    description: "Baseline with DiceCE loss and default sampling"
+    log_name: E0_baseline
+
+    # Loss configuration
+    loss:
+      type: dicece
+      params: {}
+
+    # Sampling configuration
+    sampling:
+      train_num_samples: 1
+      pos_neg_ratio: null
+
+    # Expected outcomes
+    targets:
+      - Establish baseline performance
+      - Measure current FP rate
+      - Identify worst-performing cases
+
+  E1_tversky:
+    description: "TverskyLoss to reduce false positives"
+    log_name: E1_tversky
+
+    # Loss configuration
+    loss:
+      type: tversky
+      params:
+        alpha: 0.7  # Higher alpha = penalize FP more
+        beta: 0.3   # Lower beta = penalize FN less
+
+    # Sampling configuration
+    sampling:
+      train_num_samples: 1
+      pos_neg_ratio: null
+
+    # Expected outcomes
+    targets:
+      - Reduce false positive rate
+      - Improve precision
+      - Maintain or improve recall
+
+  E2_focal_tversky:
+    description: "FocalTverskyLoss for FP reduction and hard example mining"
+    log_name: E2_focal_tversky
+
+    # Loss configuration
+    loss:
+      type: focal_tversky
+      params:
+        alpha: 0.7
+        beta: 0.3
+        gamma: 1.33  # Focal parameter for hard examples
+
+    # Sampling configuration
+    sampling:
+      train_num_samples: 1
+      pos_neg_ratio: null
+
+    # Expected outcomes
+    targets:
+      - Reduce false positive rate
+      - Improve performance on small tumors (GT<2%)
+      - Focus on hard examples
+
+  E3_enhanced_sampling:
+    description: "Enhanced sampling with increased foreground patches"
+    log_name: E3_enhanced_sampling
+
+    # Loss configuration
+    loss:
+      type: dicece
+      params: {}
+
+    # Sampling configuration
+    sampling:
+      train_num_samples: 4  # 4x more samples per epoch
+      pos_neg_ratio: 3.0    # 3:1 foreground:background ratio
+
+    # Expected outcomes
+    targets:
+      - Improve recall on small tumors
+      - Better foreground representation
+      - Reduce class imbalance effects
+
+  E4_cross_attention:
+    description: "Cross-attention between CT and MR modalities with Focal Tversky Loss"
+    log_name: E4_cross_attention
+
+    # Loss configuration
+    loss:
+      type: focal_tversky
+      params:
+        alpha: 0.7  # Higher alpha = penalize FP more
+        beta: 0.3   # Lower beta = penalize FN less
+        gamma: 1.33  # Focal parameter for hard examples
+
+    # Sampling configuration
+    sampling:
+      train_num_samples: 1
+      pos_neg_ratio: null
+
+    # Cross-attention configuration
+    cross_attention:
+      use_cross_attention: true
+      cross_attn_heads: 8  # Number of attention heads
+
+    # Expected outcomes
+    targets:
+      - Leverage complementary information from CT and MR
+      - Improve segmentation accuracy through modality fusion
+      - Better feature representation via cross-modal attention
+      - Reduce false positives with Focal Tversky Loss
+      - Focus on hard examples for better small tumor detection
+
+# Evaluation metrics
+evaluation:
+  primary_metric: foreground_dice
+
+  metrics:
+    - foreground_dice_mean
+    - foreground_dice_std
+    - precision_mean
+    - recall_mean
+
+  bucketed_metrics:
+    - name: dice_lt2
+      description: "Dice for GT positive ratio < 2%"
+      condition: "gt_positive_ratio < 0.02"
+
+    - name: dice_2to5
+      description: "Dice for GT positive ratio 2-5%"
+      condition: "0.02 <= gt_positive_ratio <= 0.05"
+
+    - name: dice_gt5
+      description: "Dice for GT positive ratio > 5%"
+      condition: "gt_positive_ratio > 0.05"
+
+  visualization:
+    worst_n_cases: 3
+    save_frequency: 1  # Save every N epochs
+    output_format: png
+
+# Analysis criteria
+analysis:
+  success_criteria:
+    precision_improvement: 0.05  # 5% improvement
+    dice_lt2_improvement: 0.10   # 10% improvement for small tumors
+    overall_dice_threshold: 0.70  # Minimum acceptable Dice
+
+  comparison_baseline: E0_baseline
+
+  decision_rules:
+    - condition: "precision_improvement > 0.05"
+      action: "Loss optimization is effective"
+      next_step: "Fine-tune alpha/beta ratio"
+
+    - condition: "dice_lt2_improvement > 0.10"
+      action: "Hard example mining is effective"
+      next_step: "Adjust gamma parameter"
+
+    - condition: "recall_improvement > 0.05 AND precision_drop < 0.02"
+      action: "Sampling strategy is effective"
+      next_step: "Optimize pos:neg ratio"

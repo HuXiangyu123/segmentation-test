@@ -1,0 +1,30 @@
+# Bone Tumor Segmentation Project - Exact Requirements
+# Generated from current working environment
+# Python 3.10
+
+# Deep Learning Framework
+torch==2.8.0
+# torchvision==0.19.0  # Match with torch version
+
+# Medical Image Processing
+monai==1.5.2
+nibabel==5.3.3
+
+# Scientific Computing
+numpy==1.26.4
+scipy==1.8.1
+
+# Data Processing
+pandas==2.3.3
+h5py==3.15.1
+
+# Visualization
+matplotlib==3.10.7
+tensorboardX==2.6.4
+
+# Utilities
+tqdm==4.65.2
+PyYAML==6.0.3
+
+# Note: This file contains exact versions from the working environment.
+# For more flexible installation, use requirements.txt instead.

@@ -446,9 +446,11 @@ def train(args, train_loader, model, optimizer, loss_function, loss_seg_CE=None)
         x, y, z, name = batch["image"].to(args.device), batch["label"].float().to(args.device), batch['modality'], batch['name']
         case_text_embedding = get_case_text_embedding(args, batch, modality=z[0])
         if args.with_text_embedding == 1:
-            logit_map = model(x, z[0], case_text_embedding=case_text_embedding)
+            output = model(x, z[0], case_text_embedding=case_text_embedding)
         else:
-            logit_map = model(x)
+            output = model(x)
+        # MulModSeg returns (logits, router_logits, routing_weights); unpack
+        logit_map = output[0] if isinstance(output, tuple) else output
 
         # Compute loss based on loss type
         if args.loss_type == 'dicece':

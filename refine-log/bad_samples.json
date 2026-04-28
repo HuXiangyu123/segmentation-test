@@ -1,0 +1,39 @@
+{
+  "last_updated": "2026-04-28",
+  "note": "Patients excluded from training due to data issues. Logged during smoke train.",
+  "categories": {
+    "officially_dropped": {
+      "reason": "Dropped in original split_seed42.json — exact reason unknown (likely registration failure or corrupted data)",
+      "patients": [
+        {"patient_id": "11687281", "batch": "unknown"},
+        {"patient_id": "12298737", "batch": "unknown"}
+      ]
+    },
+    "label_nii_not_nii_gz": {
+      "reason": "Label file present as .nii (not .nii.gz). Dataloader originally only searched for .nii.gz. FIXED in dataloader_bone_tumor.py by adding .nii fallback. These patients ARE now included in training.",
+      "fix_applied": true,
+      "fix_commit": "pending",
+      "patients": [
+        {"patient_id": "05170001", "batch": "第5批", "label_file": "05170001.nii"},
+        {"patient_id": "10947254", "batch": "第4批", "label_file": "10947254.nii"},
+        {"patient_id": "11040418", "batch": "第2批", "label_file": "11040418.nii"},
+        {"patient_id": "11084154", "batch": "第1批", "label_file": "11084154.nii.gz"},
+        {"patient_id": "11101798", "batch": "第2批", "label_file": "11101798.nii"},
+        {"patient_id": "11111382", "batch": "第2批", "label_file": "11111382.nii"},
+        {"patient_id": "11156154", "batch": "第2批", "label_file": "11156154.nii"},
+        {"patient_id": "11157029", "batch": "第2批", "label_file": "11157029.nii"},
+        {"patient_id": "11314890", "batch": "第4批", "label_file": "11314890.nii"},
+        {"patient_id": "11368751", "batch": "第4批", "label_file": "11368751.nii"},
+        {"patient_id": "11404984", "batch": "第3批", "label_file": "11404984.nii"},
+        {"patient_id": "11438070", "batch": "第3批", "label_file": "11438070.nii"},
+        {"patient_id": "11461243", "batch": "第3批", "label_file": "11461243.nii"},
+        {"patient_id": "11469297", "batch": "第3批", "label_file": "11469297.nii"},
+        {"patient_id": "11500524", "batch": "第3批", "label_file": "11500524.nii"},
+        {"patient_id": "11519753", "batch": "第3批", "label_file": "11519753.nii"},
+        {"patient_id": "11552214", "batch": "第3批", "label_file": "11552214.nii"},
+        {"patient_id": "11645731", "batch": "第3批", "label_file": "11645731.nii"},
+        {"patient_id": "11661619", "batch": "第4批", "label_file": "11661619.nii"}
+      ]
+    }
+  }
+}

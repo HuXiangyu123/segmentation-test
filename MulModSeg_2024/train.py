@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
+import sys
 import json
 import argparse
 import time
@@ -12,6 +13,11 @@ import random
 
 import warnings
 warnings.filterwarnings("ignore")
+
+# Add project root to sys.path so dataloaders are importable
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from copy import deepcopy
 from contextlib import contextmanager
@@ -25,8 +31,8 @@ from monai.metrics import DiceMetric
 from monai.networks.nets import UNet
 
 from model.MulModSeg import MulModSeg, UNet3D_cy, SwinUNETR_cy
-from dataset.dataloader_data1 import get_loader_data1
-from dataset.dataloader_bone_tumor import get_loader_bone_tumor
+from dataloader_data1 import get_loader_data1
+from dataloader_bone_tumor import get_loader_bone_tumor
 
 from optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from monai.losses import DiceCELoss
@@ -38,6 +44,7 @@ from itertools import cycle
 from utils.custom_losses import get_loss_function, boundary_dice_loss
 from utils.enhanced_validation import enhanced_validation
 from utils.case_text_embedding import CaseTextEmbeddingStore, get_case_text_embedding_from_batch
+from utils.pretrained_encoder import load_pretrained_encoder, freeze_encoder
 
 # ================= EMA / SWA helpers =================
 @torch.no_grad()
@@ -545,6 +552,19 @@ def process(args):
     if args.pretrain is not None:
         model.load_params(torch.load(args.pretrain)["state_dict"])
 
+    # Load encoder-only pretrained weights (SSL or BTCV/MONAI)
+    if getattr(args, "pretrain_encoder_only", None):
+        loaded, missing, unexpected = load_pretrained_encoder(
+            model, args.pretrain_encoder_only, strict=False, verbose=True
+        )
+        print(f"[INFO] pretrain_encoder_only: loaded={loaded}, missing={missing}, unexpected={unexpected}")
+
+    # Apply encoder freeze strategy
+    if getattr(args, "freeze_level", "none") != "none":
+        if getattr(args, "pretrain_encoder_only", None) is None and args.pretrain is None:
+            print("[WARNING] --freeze_level set but no pretrained encoder loaded; freezing random weights.")
+        freeze_encoder(model, args.freeze_level)
+
     if args.with_text_embedding == 1 and args.trans_encoding == 'word_embedding':
         word_embedding = torch.load(args.word_embedding, map_location=args.device)
         if isinstance(word_embedding, dict):
@@ -678,7 +698,7 @@ def process(args):
         if args.train_modality == 'MIX':
             use_cross_attention = getattr(args, 'use_cross_attention', False)
             if use_cross_attention:
-                from dataset.dataloader_bone_tumor import get_loader_paired_bone_tumor
+                from dataloader_bone_tumor import get_loader_paired_bone_tumor
                 train_loader_ct = get_loader_paired_bone_tumor(
                     root_dir=args.data_root_path,
                     phase='train',
@@ -1012,6 +1032,22 @@ def main():
     parser.add_argument('--loss_gamma', type=float, default=1.33, help='Focal gamma parameter')
     parser.add_argument('--pos_neg_ratio', type=float, default=None, help='Positive to negative patch ratio (e.g., 3.0 for 3:1)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
+    # ======== Pretrained encoder loading & freezing ========
+    parser.add_argument('--pretrain_encoder_only', default=None,
+                        help='Path to checkpoint; loads only encoder (swinViT.*) weights. '
+                             'Handles SSL (encoder.* → swinViT.*) and BTCV/MONAI (swinViT.*) formats.')
+    parser.add_argument('--freeze_level', default='none',
+                        choices=['all', 'stage4', 'stage34', 'none'],
+                        help='Encoder freeze strategy after loading pretrained weights. '
+                             'all=freeze stages 1-4, stage4=freeze 1-3 thaw 4, '
+                             'stage34=freeze 1-2 thaw 3-4, none=full fine-tune.')
+    # =======================================================
+
+    # ======== Fold-based data split ========
+    parser.add_argument('--fold', type=int, default=None,
+                        help='Fold index (0-4) for 5-fold cross-validation split (splits/fold5_splits.json).')
+    # =======================================
 
     args = parser.parse_args()
 

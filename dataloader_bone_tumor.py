@@ -128,19 +128,19 @@ def get_paired_ct_mr_data_dict(root_dir: str, phase: str = 'train',
         for patient_id in patient_folders:
             patient_path = os.path.join(batch_path, patient_id)
             
-            # 查找label文件
-            label_candidates = [
-                os.path.join(patient_path, f"{patient_id}.nii.gz"),
-            ]
+            # 查找label文件 (.nii.gz 优先，fallback .nii)
             label_file = None
-            for candidate in label_candidates:
+            for candidate in [
+                os.path.join(patient_path, f"{patient_id}.nii.gz"),
+                os.path.join(patient_path, f"{patient_id}.nii"),
+            ]:
                 if os.path.exists(candidate):
                     label_file = candidate
                     break
-            
+
             if label_file is None:
                 continue
-            
+
             # 查找CT和MR图像文件
             ct_candidates = [
                 os.path.join(patient_path, f"{patient_id}_ct_reg.nii.gz"),
@@ -335,12 +335,12 @@ def get_bone_tumor_data_dict(root_dir: str, modality: str = 'CT', phase: str = '
         for patient_id in patient_folders:
             patient_path = os.path.join(batch_path, patient_id)
 
-            # 查找label文件（不带后缀的.nii.gz文件）
-            label_candidates = [
-                os.path.join(patient_path, f"{patient_id}.nii.gz"),
-            ]
+            # 查找label文件 (.nii.gz 优先，fallback .nii)
             label_file = None
-            for candidate in label_candidates:
+            for candidate in [
+                os.path.join(patient_path, f"{patient_id}.nii.gz"),
+                os.path.join(patient_path, f"{patient_id}.nii"),
+            ]:
                 if os.path.exists(candidate):
                     label_file = candidate
                     break

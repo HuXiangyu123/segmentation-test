@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -5,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
+import sys
 import json
 import argparse
 import time
@@ -12,6 +15,11 @@ import random
 
 import warnings
 warnings.filterwarnings("ignore")
+
+# Add project root to sys.path so dataloaders are importable
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from copy import deepcopy
 from contextlib import contextmanager
@@ -25,8 +33,8 @@ from monai.metrics import DiceMetric
 from monai.networks.nets import UNet
 
 from model.MulModSeg import MulModSeg, UNet3D_cy, SwinUNETR_cy
-from dataset.dataloader_data1 import get_loader_data1
-from dataset.dataloader_bone_tumor import get_loader_bone_tumor
+from dataloader_data1 import get_loader_data1
+from dataloader_bone_tumor import get_loader_bone_tumor
 
 from optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from monai.losses import DiceCELoss
@@ -38,6 +46,7 @@ from itertools import cycle
 from utils.custom_losses import get_loss_function, boundary_dice_loss
 from utils.enhanced_validation import enhanced_validation
 from utils.case_text_embedding import CaseTextEmbeddingStore, get_case_text_embedding_from_batch
+from utils.pretrained_encoder import load_pretrained_encoder, freeze_encoder
 
 # ================= EMA / SWA helpers =================
 @torch.no_grad()
@@ -439,9 +448,11 @@ def train(args, train_loader, model, optimizer, loss_function, loss_seg_CE=None)
         x, y, z, name = batch["image"].to(args.device), batch["label"].float().to(args.device), batch['modality'], batch['name']
         case_text_embedding = get_case_text_embedding(args, batch, modality=z[0])
         if args.with_text_embedding == 1:
-            logit_map = model(x, z[0], case_text_embedding=case_text_embedding)
+            output = model(x, z[0], case_text_embedding=case_text_embedding)
         else:
-            logit_map = model(x)
+            output = model(x)
+        # MulModSeg returns (logits, router_logits, routing_weights); unpack
+        logit_map = output[0] if isinstance(output, tuple) else output
 
         # Compute loss based on loss type
         if args.loss_type == 'dicece':
@@ -543,10 +554,23 @@ def process(args):
 
     #Load pre-trained weights
     if args.pretrain is not None:
-        model.load_params(torch.load(args.pretrain)["state_dict"])
+        model.load_params(torch.load(args.pretrain, weights_only=False)["state_dict"])
+
+    # Load encoder-only pretrained weights (SSL or BTCV/MONAI)
+    if getattr(args, "pretrain_encoder_only", None):
+        loaded, missing, unexpected = load_pretrained_encoder(
+            model, args.pretrain_encoder_only, strict=False, verbose=True
+        )
+        print(f"[INFO] pretrain_encoder_only: loaded={loaded}, missing={missing}, unexpected={unexpected}")
+
+    # Apply encoder freeze strategy
+    if getattr(args, "freeze_level", "none") != "none":
+        if getattr(args, "pretrain_encoder_only", None) is None and args.pretrain is None:
+            print("[WARNING] --freeze_level set but no pretrained encoder loaded; freezing random weights.")
+        freeze_encoder(model, args.freeze_level)
 
     if args.with_text_embedding == 1 and args.trans_encoding == 'word_embedding':
-        word_embedding = torch.load(args.word_embedding, map_location=args.device)
+        word_embedding = torch.load(args.word_embedding, map_location=args.device, weights_only=False)
         if isinstance(word_embedding, dict):
             for key in ['organ_embedding', 'embedding', 'embeddings', 'weight']:
                 if key in word_embedding and isinstance(word_embedding[key], torch.Tensor):
@@ -596,7 +620,7 @@ def process(args):
 
     # Finetune: load model weights only, reset optimizer/scheduler/epoch
     if getattr(args, "finetune_from", None):
-        ckpt = torch.load(args.finetune_from, map_location=args.device)
+        ckpt = torch.load(args.finetune_from, map_location=args.device, weights_only=False)
         state_dict = ckpt.get("net", None)
         if state_dict is None:
             state_dict = ckpt.get("state_dict", None)
@@ -656,7 +680,7 @@ def process(args):
         print(f"[INFO] Fixed LR mode enabled: lr={optimizer.param_groups[0]['lr']}")
 
     if args.resume:
-        checkpoint = torch.load(args.resume)
+        checkpoint = torch.load(args.resume, weights_only=False)
         model.load_state_dict(checkpoint['net'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         args.epoch = checkpoint['epoch']
@@ -678,7 +702,7 @@ def process(args):
         if args.train_modality == 'MIX':
             use_cross_attention = getattr(args, 'use_cross_attention', False)
             if use_cross_attention:
-                from dataset.dataloader_bone_tumor import get_loader_paired_bone_tumor
+                from dataloader_bone_tumor import get_loader_paired_bone_tumor
                 train_loader_ct = get_loader_paired_bone_tumor(
                     root_dir=args.data_root_path,
                     phase='train',
@@ -753,9 +777,9 @@ def process(args):
 
     if args.rank == 0:
         if args.with_text_embedding == 1:
-            str_tmp = 'out/'+args.backbone+'/with_txt/CLIP_V3/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
+            str_tmp = 'experiment/'+args.backbone+'/with_txt/CLIP_V3/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
         else:
-            str_tmp = 'out/'+args.backbone+'/no_txt/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
+            str_tmp = 'experiment/'+args.backbone+'/no_txt/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
         writer = SummaryWriter(log_dir=str_tmp)
         print('Writing Tensorboard logs to ', str_tmp)
 
@@ -797,8 +821,9 @@ def process(args):
 
         # Validation
         if args.dataset == 'bone_tumor':
+            # Always write metrics + training_curves; heavy case vis gated inside enhanced_validation
             if args.rank == 0:
-                vis_output_dir = os.path.join(args.log_dir, 'visualizations')
+                vis_output_dir = args.log_dir
                 os.makedirs(vis_output_dir, exist_ok=True)
             else:
                 vis_output_dir = None
@@ -1012,6 +1037,22 @@ def main():
     parser.add_argument('--loss_gamma', type=float, default=1.33, help='Focal gamma parameter')
     parser.add_argument('--pos_neg_ratio', type=float, default=None, help='Positive to negative patch ratio (e.g., 3.0 for 3:1)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
+    # ======== Pretrained encoder loading & freezing ========
+    parser.add_argument('--pretrain_encoder_only', default=None,
+                        help='Path to checkpoint; loads only encoder (swinViT.*) weights. '
+                             'Handles SSL (encoder.* → swinViT.*) and BTCV/MONAI (swinViT.*) formats.')
+    parser.add_argument('--freeze_level', default='none',
+                        choices=['all', 'stage4', 'stage34', 'none'],
+                        help='Encoder freeze strategy after loading pretrained weights. '
+                             'all=freeze stages 1-4, stage4=freeze 1-3 thaw 4, '
+                             'stage34=freeze 1-2 thaw 3-4, none=full fine-tune.')
+    # =======================================================
+
+    # ======== Fold-based data split ========
+    parser.add_argument('--fold', type=int, default=None,
+                        help='Fold index (0-4) for 5-fold cross-validation split (splits/fold5_splits.json).')
+    # =======================================
 
     args = parser.parse_args()
 

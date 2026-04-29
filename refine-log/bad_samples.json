@@ -1,0 +1,61 @@
+{
+  "last_updated": "2026-04-29",
+  "note": "Patients excluded from training due to data issues.",
+  "drop_list": [
+    "11687281",
+    "12298737",
+    "10180747",
+    "11232743",
+    "11744770",
+    "11084154",
+    "11768711"
+  ],
+  "categories": {
+    "registration_failure": {
+      "reason": "MR/SEG shape or affine mismatch — likely registration failure. Already absent from dataset.",
+      "patients": [
+        {"patient_id": "11687281", "batch": "unknown"},
+        {"patient_id": "12298737", "batch": "unknown"}
+      ]
+    },
+    "manually_flagged_image_quality": {
+      "reason": "Manually flagged from image review — poor quality or annotation issues visible in screenshots.",
+      "patients": [
+        {"patient_id": "10180747", "batch": "第4批"},
+        {"patient_id": "11232743", "batch": "第5批"},
+        {"patient_id": "11744770", "batch": "第4批"}
+      ]
+    },
+    "ct_mr_shape_affine_mismatch": {
+      "reason": "CT raw vs MR/SEG shape or affine mismatch (CT reg matches, but raw CT discrepancy suggests registration path issues).",
+      "patients": [
+        {"patient_id": "11084154", "batch": "第1批", "note": "Also present in 第2批 as separate sample"},
+        {"patient_id": "11768711", "batch": "第1批"}
+      ]
+    },
+    "label_nii_not_nii_gz": {
+      "reason": "Label file present as .nii (not .nii.gz). Dataloader originally only searched for .nii.gz. FIXED — .nii fallback added.",
+      "fix_applied": true,
+      "patients": [
+        {"patient_id": "05170001", "batch": "第5批"},
+        {"patient_id": "10947254", "batch": "第4批"},
+        {"patient_id": "11040418", "batch": "第2批"},
+        {"patient_id": "11101798", "batch": "第2批"},
+        {"patient_id": "11111382", "batch": "第2批"},
+        {"patient_id": "11156154", "batch": "第2批"},
+        {"patient_id": "11157029", "batch": "第2批"},
+        {"patient_id": "11314890", "batch": "第4批"},
+        {"patient_id": "11368751", "batch": "第4批"},
+        {"patient_id": "11404984", "batch": "第3批"},
+        {"patient_id": "11438070", "batch": "第3批"},
+        {"patient_id": "11461243", "batch": "第3批"},
+        {"patient_id": "11469297", "batch": "第3批"},
+        {"patient_id": "11500524", "batch": "第3批"},
+        {"patient_id": "11519753", "batch": "第3批"},
+        {"patient_id": "11552214", "batch": "第3批"},
+        {"patient_id": "11645731", "batch": "第3批"},
+        {"patient_id": "11661619", "batch": "第4批"}
+      ]
+    }
+  }
+}

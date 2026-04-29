@@ -89,3 +89,8 @@ docs/
 .cursor/
 output/
 templates/
+
+# Experiment outputs & pretrained weights
+experiment/
+vis_sort/
+MulModSeg_2024/pretrained/

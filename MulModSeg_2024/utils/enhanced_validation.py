@@ -1034,45 +1034,11 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
             f"Pred%={case['pred_positive_ratio']*100:.2f}%"
         )
 
+    # ---- metrics CSV + training curves (always) ----
     if output_dir is not None:
-        # 最差三个可视化
-        vis_dir_worst = Path(output_dir) / f'epoch_{epoch:03d}_worst3'
-        vis_dir_worst.mkdir(parents=True, exist_ok=True)
-
-        for i, case in enumerate(worst_3):
-            safe_name = case['case_name'].replace('/', '_').replace('\\', '_')
-            output_path = vis_dir_worst / f'worst{i+1}_{safe_name}_dice{case["foreground_dice"]:.3f}.png'
-            visualize_case(
-                case['image'],
-                case['label'],
-                case['pred'],
-                f"Worst-{i+1}: {case['case_name']} (Dice={case['foreground_dice']:.3f})",
-                output_path,
-                mr_image=case.get('mr_image', None),
-            )
-
-        print(f"\n[Visualization] Saved worst-3 cases to: {vis_dir_worst}")
-
-        # 最好三个可视化
-        vis_dir_best = Path(output_dir) / f'epoch_{epoch:03d}_best3'
-        vis_dir_best.mkdir(parents=True, exist_ok=True)
-
-        for i, case in enumerate(best_3):
-            safe_name = case['case_name'].replace('/', '_').replace('\\', '_')
-            output_path = vis_dir_best / f'best{i+1}_{safe_name}_dice{case["foreground_dice"]:.3f}.png'
-            visualize_case(
-                case['image'],
-                case['label'],
-                case['pred'],
-                f"Best-{i+1}: {case['case_name']} (Dice={case['foreground_dice']:.3f})",
-                output_path,
-                mr_image=case.get('mr_image', None),
-            )
-
-        print(f"[Visualization] Saved best-3 cases to: {vis_dir_best}")
-
-        # 记录 epoch 级别指标，并更新 Loss / Dice / LR 曲线
-        metrics_csv = Path(output_dir) / "metrics_epoch.csv"
+        metrics_dir = Path(output_dir) / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        metrics_csv = metrics_dir / "metrics_epoch.csv"
         _append_epoch_metrics(
             metrics_csv,
             epoch,
@@ -1093,7 +1059,7 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
             loss=loss,
             lr=lr,
         )
-        plot_epoch_curves(metrics_csv, output_dir=output_dir)
+        plot_epoch_curves(metrics_csv, output_dir=metrics_dir)
         plot_validation_summary(
             {
                 'foreground_dice_mean': foreground_dice_mean,
@@ -1109,8 +1075,46 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
             },
             curve_data,
             epoch=epoch,
-            output_dir=output_dir,
+            output_dir=metrics_dir,
         )
+
+        # ---- heavy case visualizations (every 10 epochs) ----
+        if (epoch % 10 == 0):
+            # 最差三个可视化
+            vis_dir_worst = Path(output_dir) / f'epoch_{epoch:03d}_worst3'
+            vis_dir_worst.mkdir(parents=True, exist_ok=True)
+
+            for i, case in enumerate(worst_3):
+                safe_name = case['case_name'].replace('/', '_').replace('\\', '_')
+                output_path = vis_dir_worst / f'worst{i+1}_{safe_name}_dice{case["foreground_dice"]:.3f}.png'
+                visualize_case(
+                    case['image'],
+                    case['label'],
+                    case['pred'],
+                    f"Worst-{i+1}: {case['case_name']} (Dice={case['foreground_dice']:.3f})",
+                    output_path,
+                    mr_image=case.get('mr_image', None),
+                )
+
+            print(f"\n[Visualization] Saved worst-3 cases to: {vis_dir_worst}")
+
+            # 最好三个可视化
+            vis_dir_best = Path(output_dir) / f'epoch_{epoch:03d}_best3'
+            vis_dir_best.mkdir(parents=True, exist_ok=True)
+
+            for i, case in enumerate(best_3):
+                safe_name = case['case_name'].replace('/', '_').replace('\\', '_')
+                output_path = vis_dir_best / f'best{i+1}_{safe_name}_dice{case["foreground_dice"]:.3f}.png'
+                visualize_case(
+                    case['image'],
+                    case['label'],
+                    case['pred'],
+                    f"Best-{i+1}: {case['case_name']} (Dice={case['foreground_dice']:.3f})",
+                    output_path,
+                    mr_image=case.get('mr_image', None),
+                )
+
+            print(f"[Visualization] Saved best-3 cases to: {vis_dir_best}")
 
     model.train()
 

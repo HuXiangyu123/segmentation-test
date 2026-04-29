@@ -35,12 +35,24 @@ _ENCODER_PREFIXES = (
 
 
 def _remap_ssl_keys(raw_state: dict) -> dict:
-    """Remap SSL pretrained keys: encoder.X → swinViT.X (encoder-only)."""
+    """Remap SSL pretrained keys: encoder.X → swinViT.X (encoder-only).
+
+    Also collapses the extra nesting level in layer paths:
+      SSL:  encoder.layers1.0.0.blocks.X → swinViT.layers1.0.blocks.X
+    """
+    import re
+
     remapped = {}
     for k, v in raw_state.items():
-        if k.startswith("encoder."):
-            new_k = "swinViT." + k[len("encoder."):]
-            remapped[new_k] = v
+        if not k.startswith("encoder."):
+            continue
+        # Skip mask_token (no equivalent in model)
+        if k == "encoder.mask_token":
+            continue
+        new_k = "swinViT." + k[len("encoder."):]
+        # Collapse layers<N>.0.0 → layers<N>.0 (SSL has extra Sequential nesting)
+        new_k = re.sub(r"(layers\d+)\.0\.0\.", r"\1.0.", new_k)
+        remapped[new_k] = v
     return remapped
 
 
@@ -118,6 +130,20 @@ def load_pretrained_encoder(
     if verbose:
         print(f"[pretrained_encoder] Filtered to {len(filtered)} encoder-prefix keys.")
 
+    # Detect key prefix: model state dict may have backbone.swinViT.* not swinViT.*
+    model_swin_keys = [k for k in model.state_dict().keys() if "swinViT." in k]
+    key_prefix = ""
+    if model_swin_keys:
+        # Extract prefix from first swinViT key, e.g. "backbone.swinViT.xxx" → prefix "backbone."
+        first = model_swin_keys[0]
+        idx = first.index("swinViT.")
+        key_prefix = first[:idx]  # e.g. "backbone." or ""
+        if verbose and key_prefix:
+            print(f"[pretrained_encoder] Detected model key prefix: '{key_prefix}'")
+
+    if key_prefix:
+        filtered = {key_prefix + k: v for k, v in filtered.items()}
+
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     # 'missing' here = model keys not in filtered (expected: all non-swinViT keys)
     # 'unexpected' should be empty since we filtered
@@ -165,11 +191,13 @@ def freeze_encoder(model: nn.Module, freeze_level: str) -> None:
     if freeze_level == "all":
         for stage in [swin.layers1, swin.layers2, swin.layers3, swin.layers4]:
             _set_requires_grad(stage, requires_grad=False)
-        _set_requires_grad(swin.norm, requires_grad=False)
+        if hasattr(swin, "norm"):
+            _set_requires_grad(swin.norm, requires_grad=False)
     elif freeze_level == "stage4":
         for stage in [swin.layers1, swin.layers2, swin.layers3]:
             _set_requires_grad(stage, requires_grad=False)
-        _set_requires_grad(swin.norm, requires_grad=False)
+        if hasattr(swin, "norm"):
+            _set_requires_grad(swin.norm, requires_grad=False)
     elif freeze_level == "stage34":
         for stage in [swin.layers1, swin.layers2]:
             _set_requires_grad(stage, requires_grad=False)

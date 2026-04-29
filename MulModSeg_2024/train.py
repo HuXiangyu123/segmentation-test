@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -552,7 +554,7 @@ def process(args):
 
     #Load pre-trained weights
     if args.pretrain is not None:
-        model.load_params(torch.load(args.pretrain)["state_dict"])
+        model.load_params(torch.load(args.pretrain, weights_only=False)["state_dict"])
 
     # Load encoder-only pretrained weights (SSL or BTCV/MONAI)
     if getattr(args, "pretrain_encoder_only", None):
@@ -568,7 +570,7 @@ def process(args):
         freeze_encoder(model, args.freeze_level)
 
     if args.with_text_embedding == 1 and args.trans_encoding == 'word_embedding':
-        word_embedding = torch.load(args.word_embedding, map_location=args.device)
+        word_embedding = torch.load(args.word_embedding, map_location=args.device, weights_only=False)
         if isinstance(word_embedding, dict):
             for key in ['organ_embedding', 'embedding', 'embeddings', 'weight']:
                 if key in word_embedding and isinstance(word_embedding[key], torch.Tensor):
@@ -618,7 +620,7 @@ def process(args):
 
     # Finetune: load model weights only, reset optimizer/scheduler/epoch
     if getattr(args, "finetune_from", None):
-        ckpt = torch.load(args.finetune_from, map_location=args.device)
+        ckpt = torch.load(args.finetune_from, map_location=args.device, weights_only=False)
         state_dict = ckpt.get("net", None)
         if state_dict is None:
             state_dict = ckpt.get("state_dict", None)
@@ -678,7 +680,7 @@ def process(args):
         print(f"[INFO] Fixed LR mode enabled: lr={optimizer.param_groups[0]['lr']}")
 
     if args.resume:
-        checkpoint = torch.load(args.resume)
+        checkpoint = torch.load(args.resume, weights_only=False)
         model.load_state_dict(checkpoint['net'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         args.epoch = checkpoint['epoch']
@@ -775,9 +777,9 @@ def process(args):
 
     if args.rank == 0:
         if args.with_text_embedding == 1:
-            str_tmp = 'out/'+args.backbone+'/with_txt/CLIP_V3/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
+            str_tmp = 'experiment/'+args.backbone+'/with_txt/CLIP_V3/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
         else:
-            str_tmp = 'out/'+args.backbone+'/no_txt/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
+            str_tmp = 'experiment/'+args.backbone+'/no_txt/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
         writer = SummaryWriter(log_dir=str_tmp)
         print('Writing Tensorboard logs to ', str_tmp)
 
@@ -819,8 +821,9 @@ def process(args):
 
         # Validation
         if args.dataset == 'bone_tumor':
+            # Always write metrics + training_curves; heavy case vis gated inside enhanced_validation
             if args.rank == 0:
-                vis_output_dir = os.path.join(args.log_dir, 'visualizations')
+                vis_output_dir = args.log_dir
                 os.makedirs(vis_output_dir, exist_ok=True)
             else:
                 vis_output_dir = None

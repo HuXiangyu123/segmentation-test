@@ -1,8 +1,9 @@
 # Experiment Tracker
 
-**Last Updated**: 2026-04-28
-**Total GPU Budget**: ~13h (must-run) to 19h (complete)
-**Hardware**: 2× RTX 3090
+**Last Updated**: 2026-04-30
+**Total GPU Budget**: ~64h (must-run) to 100h (complete)
+**Hardware**: 2× RTX 3090, all experiments use `torchrun --nproc_per_node=2`
+**Training Config**: batch_size=1/GPU, roi_size=96³, num_samples=3, lr=1e-4, effective batch=6
 
 ---
 
@@ -14,6 +15,12 @@
 - ⚠️ Blocked — waiting on dependency or manual action
 
 ---
+
+## E0: Baseline (SwinUNETR, no pretrained, DDP)
+
+| Exp ID | Variant | Status | Start | End | GPU-h | Dice (fg) | Dice (pelvis) | Precision | Notes |
+|--------|---------|--------|-------|-----|-------|-----------|---------------|-----------|-------|
+| E0_baseline_swinunetr | SwinUNETR, DiceCE, MIX | ✅ | 04-30 01:49 | 04-30 10:27 | ~17.0h | **0.6310** | — | 0.651 | DDP 2×3090, 210ep, lr=1e-4, num_samples=3, best ep65 |
 
 ## M0: Quick-Win Pilots
 
@@ -46,8 +53,8 @@
 
 | Exp ID | Freeze Config | Status | Start | End | GPU-h | Dice (fg) | Dice (pelvis) | Precision | Notes |
 |--------|--------------|--------|-------|-----|-------|-----------|---------------|-----------|-------|
-| M2b_freeze_all | Freeze stages 1-4 | ⚠️ | — | — | — | — | — | — | Blocked: pretrained weights |
-| M2b_freeze_s4 | Freeze 1-3, thaw 4 | ⬜ | — | — | — | — | — | — | |
+| M2b_freeze_all | Freeze stages 1-4 | ✅ | 04-29 13:08 | 04-29 18:17 | ~5.0h | **0.7173** | — | 0.765 | SSL pretrained, best ep65 |
+| M2b_freeze_s4 | Freeze 1-3, thaw 4 | ✅ | 04-29 10:52 | 04-29 18:17 | ~5.0h | **0.7160** | — | 0.768 | SSL pretrained, best ep65 |
 | M2b_freeze_s34 | Freeze 1-2, thaw 3-4 | ⬜ | — | — | — | — | — | — | |
 | M2b_full_finetune | No freeze | ⬜ | — | — | — | — | — | — | |
 | M2b_no_pretrain | No pretrained weights | ⬜ | — | — | — | — | — | — | |
@@ -63,7 +70,7 @@
 | Exp ID | Variant | Status | Start | End | GPU-h | Dice (fg) | Dice (pelvis) | Precision | Notes |
 |--------|---------|--------|-------|-----|-------|-----------|---------------|-----------|-------|
 | M3a_schema_design | Create struct output schema + prompt | ⬜ | — | — | — | — | — | — | Code, no GPU |
-| M3a_llm_generate | Run LLM for all 110 cases | ⚠️ | — | — | — | — | — | — | Blocked: API key |
+| M3a_llm_generate | Run LLM for all 102 patients | ⚠️ | — | — | — | — | — | — | Blocked: API key |
 | M3a_biomedclip_encode | Encode to BiomedCLIP embeddings | ⚠️ | — | — | — | — | — | — | Blocked: M3a_generate |
 | M3a_train | Train with LLM text features | ⬜ | — | — | — | — | — | — | |
 
@@ -93,7 +100,7 @@
 
 ### Weight Downloads (pre-M2)
 - [ ] **BiomedCLIP**: `AutoModel.from_pretrained('microsoft/BiomedCLIP-PubMedBERT_256_vit_base_patch16')`
-- [ ] **SwinUNETR BTCV**: `SwinUNETR(img_size=(96,96,96), in_channels=1, out_channels=14, feature_size=48, pretrained=True)`
+- [x] **SwinUNETR SSL pretrained**: `MulModSeg_2024/pretrained/ssl_pretrained_weights.pth` (720MB, already in repo)
 
 ### Model Clones (to comparative/)
 - [ ] `git clone https://github.com/MIC-DKFZ/MedNeXt.git comparative/MedNeXt`
@@ -104,5 +111,5 @@
 ### LLM (M3a)
 - [ ] Set API key in `.env`: `OPENAI_API_KEY=...` or `ANTHROPIC_API_KEY=...`
 - [ ] Write `scripts/generate_llm_descriptions.py` with struct output schema
-- [ ] Run all 110 cases through LLM → store structured JSON
+- [ ] Run all 102 patients through LLM → store structured JSON
 - [ ] Encode with BiomedCLIP → `text_embedding/llm_biomedclip.pth`

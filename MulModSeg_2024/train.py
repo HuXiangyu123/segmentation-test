@@ -3,6 +3,8 @@ matplotlib.use('Agg')
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -60,12 +62,14 @@ def _ema_update_(ema_model, model, decay: float):
 
 @contextmanager
 def _temporary_state_dict(model: torch.nn.Module, state_dict: dict):
-    backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(state_dict, strict=False)
+    # Use underlying model for DDP to avoid module. prefix mismatch
+    base_model = model.module if hasattr(model, 'module') else model
+    backup = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
+    base_model.load_state_dict(state_dict, strict=False)
     try:
         yield
     finally:
-        model.load_state_dict(backup, strict=False)
+        base_model.load_state_dict(backup, strict=False)
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # torch.multiprocessing.set_sharing_strategy('file_system')
@@ -520,8 +524,24 @@ def process(args):
         torch.backends.cudnn.benchmark = False
     print(f"[INFO] Random seed set to: {args.seed}")
 
-    args.device = torch.device(f"cuda:{args.device}") 
-    torch.cuda.set_device(f"{args.device}")  
+    # DDP initialization
+    distributed = getattr(args, 'distributed', False)
+    if distributed:
+        dist.init_process_group(backend='nccl', init_method='env://')
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        args.device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(args.device)
+        args.rank = dist.get_rank()
+        args.world_size = dist.get_world_size()
+        # Per-rank seeding for different augmentations
+        torch.manual_seed(args.seed + args.rank)
+        torch.cuda.manual_seed(args.seed + args.rank)
+        torch.cuda.manual_seed_all(args.seed + args.rank)
+        print(f"[DDP] Rank {args.rank}/{args.world_size}, local_rank={local_rank}")
+    else:
+        args.device = torch.device(f"cuda:{args.device}")
+        torch.cuda.set_device(args.device)
+        args.world_size = 1  
 
     if getattr(args, "resume", None) and getattr(args, "finetune_from", None):
         raise ValueError("--resume and --finetune_from are mutually exclusive. Use --resume to continue training, or --finetune_from to restart with reset LR.")
@@ -600,11 +620,18 @@ def process(args):
     model.to(args.device)
     model.train()
 
+    # DDP wrapping (after model.to(device), before optimizer creation)
+    if distributed:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        print(f"[DDP] Model wrapped with DistributedDataParallel")
+
     # Optional EMA/SWA models (evaluation/saving only)
     args.ema_model = None
     args.swa_model = None
+    base_model = model.module if distributed else model
     if getattr(args, "use_ema", False):
-        args.ema_model = deepcopy(model).to(args.device)
+        args.ema_model = deepcopy(base_model).to(args.device)
         args.ema_model.eval()
         for p in args.ema_model.parameters():
             p.requires_grad_(False)
@@ -612,7 +639,7 @@ def process(args):
 
     if getattr(args, "use_swa", False):
         from torch.optim.swa_utils import AveragedModel
-        args.swa_model = AveragedModel(model).to(args.device)
+        args.swa_model = AveragedModel(base_model).to(args.device)
         args.swa_model.eval()
         for p in args.swa_model.parameters():
             p.requires_grad_(False)
@@ -638,10 +665,11 @@ def process(args):
             args.epoch = 0
 
         # If EMA/SWA enabled, re-init them from the loaded weights
+        base_model_for_resume = model.module if distributed else model
         if getattr(args, "ema_model", None) is not None:
-            args.ema_model.load_state_dict(model.state_dict(), strict=False)
+            args.ema_model.load_state_dict(base_model_for_resume.state_dict(), strict=False)
         if getattr(args, "swa_model", None) is not None:
-            args.swa_model = args.swa_model.__class__(model).to(args.device)
+            args.swa_model = args.swa_model.__class__(base_model_for_resume).to(args.device)
             args.swa_model.eval()
             for p in args.swa_model.parameters():
                 p.requires_grad_(False)
@@ -690,6 +718,12 @@ def process(args):
 
     torch.backends.cudnn.benchmark = True
 
+    # Default drop list for bone_tumor dataset
+    DEFAULT_DROP_LIST = ['11687281', '12298737', '10180747', '11232743', '11744770', '11084154', '11768711']
+    drop_list = getattr(args, 'drop_list', None)
+    if drop_list is None and args.dataset == 'bone_tumor':
+        drop_list = DEFAULT_DROP_LIST
+
     # train loader
     if args.dataset == 'data1':
         if args.train_modality == 'MIX':
@@ -712,6 +746,7 @@ def process(args):
                     persistent=True,
                     num_workers=args.num_workers,
                     random_seed=args.seed,
+                    distributed=distributed,
                 )
                 train_loader_mr = None
                 val_loader = get_loader_paired_bone_tumor(
@@ -722,6 +757,7 @@ def process(args):
                     persistent=True,
                     num_workers=0,
                     random_seed=args.seed,
+                    distributed=distributed,
                 )
                 print(f"[INFO] Cross-attention mode: Using paired CT+MR loader")
             else:
@@ -734,6 +770,10 @@ def process(args):
                     train_num_samples=args.num_samples,
                     persistent=True,
                     num_workers=args.num_workers,
+                    drop_list=drop_list,
+                    fold=getattr(args, 'fold', None),
+                    split_file=getattr(args, 'split_file', None),
+                    distributed=distributed,
                 )
                 val_loader = get_loader_bone_tumor(
                     root_dir=args.data_root_path,
@@ -744,6 +784,10 @@ def process(args):
                     train_num_samples=1,
                     persistent=True,
                     num_workers=args.num_workers,
+                    drop_list=drop_list,
+                    fold=getattr(args, 'fold', None),
+                    split_file=getattr(args, 'split_file', None),
+                    distributed=distributed,
                 )
         else:
             train_loader = get_loader_bone_tumor(
@@ -755,6 +799,10 @@ def process(args):
                 train_num_samples=args.num_samples,
                 persistent=True,
                 num_workers=args.num_workers,
+                drop_list=drop_list,
+                fold=getattr(args, 'fold', None),
+                split_file=getattr(args, 'split_file', None),
+                distributed=distributed,
             )
             val_loader = get_loader_bone_tumor(
                 root_dir=args.data_root_path,
@@ -765,6 +813,10 @@ def process(args):
                 train_num_samples=1,
                 persistent=True,
                 num_workers=args.num_workers,
+                drop_list=drop_list,
+                fold=getattr(args, 'fold', None),
+                split_file=getattr(args, 'split_file', None),
+                distributed=distributed,
             )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
@@ -775,11 +827,13 @@ def process(args):
     else:
         print(f"[Dataset] Train samples: {len(train_loader.dataset)}, Val samples: {len(val_loader.dataset)}")
 
+    # Log directory (same path for all ranks, only rank 0 writes)
+    if args.with_text_embedding == 1:
+        str_tmp = 'experiment/'+args.backbone+'/with_txt/CLIP_V3/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
+    else:
+        str_tmp = 'experiment/'+args.backbone+'/no_txt/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
+
     if args.rank == 0:
-        if args.with_text_embedding == 1:
-            str_tmp = 'experiment/'+args.backbone+'/with_txt/CLIP_V3/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
-        else:
-            str_tmp = 'experiment/'+args.backbone+'/no_txt/' + args.log_name + '_' + args.train_modality + f'_lr{args.lr}' + f'_max_epoch{args.max_epoch}' + time.strftime('_%m_%d_%H_%M', time.localtime())
         writer = SummaryWriter(log_dir=str_tmp)
         print('Writing Tensorboard logs to ', str_tmp)
 
@@ -794,6 +848,13 @@ def process(args):
     e1_history = []
 
     while args.epoch < args.max_epoch:
+        # Set epoch for DistributedSampler to ensure proper shuffling
+        if distributed:
+            for _loader_name in ['train_loader', 'train_loader_ct', 'train_loader_mr']:
+                _loader = locals().get(_loader_name)
+                if _loader is not None and hasattr(_loader, 'sampler') and hasattr(_loader.sampler, 'set_epoch'):
+                    _loader.sampler.set_epoch(args.epoch)
+
         if scheduler is not None:
             scheduler.step()
         if args.train_modality == 'MIX':
@@ -846,7 +907,8 @@ def process(args):
                         epoch=args.epoch,
                         output_dir=vis_output_dir,
                         loss=(loss_bce + loss_dice),
-                        lr=optimizer.param_groups[0]['lr']
+                        lr=optimizer.param_groups[0]['lr'],
+                        best_dice=best_dice
                     )
             else:
                 val_metrics = enhanced_validation(
@@ -854,7 +916,8 @@ def process(args):
                     epoch=args.epoch,
                     output_dir=vis_output_dir,
                     loss=(loss_bce + loss_dice),
-                    lr=optimizer.param_groups[0]['lr']
+                    lr=optimizer.param_groups[0]['lr'],
+                    best_dice=best_dice
                 )
 
             current_val_dice = val_metrics['foreground_dice_mean']
@@ -886,7 +949,7 @@ def process(args):
                     best_epoch = args.epoch
                     print(f'🎯 New best Dice: {best_dice:.8f} at epoch {best_epoch}')
 
-                    best_net_state = model.state_dict()
+                    best_net_state = model.module.state_dict() if distributed else model.state_dict()
                     if getattr(args, "ema_model", None) is not None:
                         best_net_state = args.ema_model.state_dict()
                     elif getattr(args, "swa_model", None) is not None and args.epoch >= args.swa_start:
@@ -928,25 +991,20 @@ def process(args):
             writer.add_scalar('total_loss', loss_bce + loss_dice, args.epoch)
             writer.add_scalar('lr', optimizer.param_groups[0]['lr'], args.epoch)
 
-        should_save = (
-            (args.rank == 0)
-            and (
-                (args.epoch % args.store_num == 0 and args.epoch != 0)
-                or (args.max_epoch - args.epoch <= 5)
-            )
-        )
-        if should_save:
-            checkpoint = {
-                "net": model.state_dict(),
-                'optimizer':optimizer.state_dict(),
-                "epoch": args.epoch
+        # Only save best_model.pt (saved above on new best).
+        # Regular epoch checkpoints removed to save disk space.
+        # Keep a single last_model.pt for crash recovery (overwritten each epoch).
+        if args.rank == 0:
+            last_ckpt = {
+                "net": model.module.state_dict() if distributed else model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                "epoch": args.epoch,
+                "best_dice": best_dice,
+                "best_epoch": best_epoch,
             }
             if scheduler is not None:
-                checkpoint['scheduler'] = scheduler.state_dict()
-            if not os.path.isdir(str_tmp):
-                os.makedirs(str_tmp, exist_ok=True)
-            torch.save(checkpoint, str_tmp + '/epoch_' + str(args.epoch) + '.pt')
-            print('save model success')
+                last_ckpt['scheduler'] = scheduler.state_dict()
+            torch.save(last_ckpt, str_tmp + '/last_model.pt')
 
         args.epoch += 1
 
@@ -972,13 +1030,17 @@ def process(args):
                 f.write(f"  Best Epoch: {best_epoch}\n")
             print(f"[INFO] Training summary saved to: {final_log_path}")
 
+    if distributed:
+        dist.destroy_process_group()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default=0, choices=[0, 1, 2, 3, 4, 5, 6, 7], type=int, help="GPU device")
     parser.add_argument("--epoch", default=0)
     parser.add_argument('--log_name', default='unet', help='The path resume from checkpoint')
     parser.add_argument('--rank', default=0, type=int, help='use tensorboardX to log the training process')
-    parser.add_argument('--backbone', default='unet', help='backbone [swinunetr or unet or dints or unetpp]')
+    parser.add_argument('--distributed', action='store_true', help='Enable DDP training via torchrun')
+    parser.add_argument('--backbone', default='swinunetr', help='backbone [swinunetr or unet or dints or unetpp]')
     parser.add_argument('--resume', default=None, help='The path resume from checkpoint')
     parser.add_argument('--finetune_from', default=None, help='Load model weights only (reset LR/optimizer/scheduler/epoch) and start a new training run')
     parser.add_argument('--pretrain', default=None, help='The path of pretrain model.')
@@ -1051,7 +1113,13 @@ def main():
 
     # ======== Fold-based data split ========
     parser.add_argument('--fold', type=int, default=None,
-                        help='Fold index (0-4) for 5-fold cross-validation split (splits/fold5_splits.json).')
+                        help='Fold index (0-4) for 5-fold cross-validation split (splits/fold5_splits.json). '
+                             'If not specified, uses default 80/20 train/val split.')
+    parser.add_argument('--split_file', type=str, default=None,
+                        help='Path to split JSON file (default: splits/fold5_splits.json when --fold is set)')
+    parser.add_argument('--drop_list', type=str, nargs='*', default=None,
+                        help='Patient IDs to exclude from dataset. '
+                             'Default: 11687281 12298737 10180747 11232743 11744770 11084154 11768711')
     # =======================================
 
     args = parser.parse_args()

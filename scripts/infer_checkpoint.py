@@ -118,23 +118,37 @@ def compute_dice(pred, gt, smooth=1e-8):
     return (2.0 * inter + smooth) / (pred.sum() + gt.sum() + smooth)
 
 
-def run_inference(model, val_loader, device, roi_size=(96, 96, 96)):
+def run_inference(model, val_loader, device, roi_size=(96, 96, 96), paired=False):
     """Run sliding window inference on validation set."""
     results = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
-            x = batch['image'].to(device)
             y = batch['label'].to(device)
-
             case_name = batch.get('name', [f'case_{batch_idx}'])[0] if 'name' in batch else f'case_{batch_idx}'
 
-            # Single-CT inference (no paired MR)
-            def predictor(x_patch):
-                outputs = model(x_patch, 'CT')
-                return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+            if paired and 'ct' in batch and 'mr' in batch:
+                # Paired CT+MR inference
+                x_ct = batch['ct'].to(device)
+                x_mr = batch['mr'].to(device)
+                x_combined = torch.cat([x_ct, x_mr], dim=1)  # [B, 2, D, H, W]
 
-            logit_map = sliding_window_inference(x, roi_size, 1, predictor, overlap=0.5)
+                def paired_predictor(combined_patch):
+                    ct_patch = combined_patch[:, 0:1]
+                    mr_patch = combined_patch[:, 1:2]
+                    outputs = model(ct_patch, 'CT', x_in_mr=mr_patch)
+                    return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+
+                logit_map = sliding_window_inference(x_combined, roi_size, 1, paired_predictor, overlap=0.5)
+            else:
+                # Single-CT inference
+                x = batch['image'].to(device) if 'image' in batch else batch['ct'].to(device)
+
+                def predictor(x_patch):
+                    outputs = model(x_patch, 'CT')
+                    return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+
+                logit_map = sliding_window_inference(x, roi_size, 1, predictor, overlap=0.5)
 
             prob_map = torch.softmax(logit_map, dim=1)
             pred_binary = (torch.argmax(logit_map, dim=1, keepdim=True) == 1).float()
@@ -191,7 +205,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='0', help='GPU device')
-    parser.add_argument('--fold', type=int, default=None, help='Fold index (0-4), None for ratio split')
+    parser.add_argument('--fold', type=int, default=0, help='Fold index (0-4), default=0')
+    parser.add_argument('--split_file', type=str, default='splits/fold5_splits.json', help='Split file path')
     parser.add_argument('--output_json', type=str, default=None, help='Save results to JSON')
     args = parser.parse_args()
 
@@ -202,26 +217,62 @@ def main():
     print(f"[INFO] Loading checkpoint: {args.checkpoint}")
     model = load_model_from_checkpoint(args.checkpoint, device)
 
+    # Load drop list from split file
+    with open(args.split_file) as f:
+        split_data = json.load(f)
+    drop_list = split_data.get('drop_list', [])
+    print(f"[INFO] Drop list: {len(drop_list)} patients")
+
     # Load data splits
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'MulModSeg_2024'))
-    from dataloader_bone_tumor import get_loader_bone_tumor
+    from dataloader_bone_tumor import get_loader_bone_tumor, get_loader_paired_bone_tumor
 
-    # Use single-modality loader (CT) for inference
-    # Paired CT+MR requires skip_fusion which may not exist in legacy checkpoints
-    val_loader = get_loader_bone_tumor(
-        root_dir=args.data_root_path,
-        modality='CT',
-        phase='val',
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        fold=args.fold,
-        distributed=False,
-    )
-    print(f"[INFO] Val samples: {len(val_loader.dataset)}")
+    paired = args.train_modality == 'MIX'
+    if paired:
+        val_loader = get_loader_paired_bone_tumor(
+            root_dir=args.data_root_path,
+            phase='val',
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            fold=args.fold,
+            split_file=args.split_file,
+            drop_list=drop_list,
+            distributed=False,
+        )
+    else:
+        val_loader = get_loader_bone_tumor(
+            root_dir=args.data_root_path,
+            modality='CT',
+            phase='val',
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            fold=args.fold,
+            split_file=args.split_file,
+            drop_list=drop_list,
+            distributed=False,
+        )
+    print(f"[INFO] Val samples: {len(val_loader.dataset)}, paired={paired}")
 
     # Run inference
-    print(f"\n[INFO] Running inference...")
-    results = run_inference(model, val_loader, device, roi_size)
+    print(f"\n[INFO] Running inference (mode={'paired CT+MR' if paired else 'single CT'})...")
+    results = run_inference(model, val_loader, device, roi_size, paired=paired)
+
+    # Also run CT-only if paired, for comparison
+    if paired:
+        print(f"\n{'='*60}")
+        print(f"[INFO] Also running CT-only inference for comparison...")
+        ct_val_loader = get_loader_bone_tumor(
+            root_dir=args.data_root_path,
+            modality='CT',
+            phase='val',
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            fold=args.fold,
+            split_file=args.split_file,
+            drop_list=drop_list,
+            distributed=False,
+        )
+        ct_results = run_inference(model, ct_val_loader, device, roi_size, paired=False)
 
     # Save results
     if args.output_json:

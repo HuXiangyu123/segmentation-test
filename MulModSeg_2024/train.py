@@ -357,8 +357,9 @@ def train_mix(args, train_loader_ct, train_loader_mr, model, optimizer, loss_fun
         # 4. ================= 核心：强监督 MoE 路由 Loss =================
         # 动态构建 ID 到批次的映射表 (只在第一步读取，不影响速度)
         if step == 0 and not hasattr(args, "id_to_batch"):
-            # 请确保这里的路径能正确找到你的 split_seed42.json
-            json_path = os.path.join('/root/autodl-tmp/segmentation-test-main/splits/split_seed42.json') 
+            # 使用 args.split_file (默认由 process() 设为 'splits/split_seed42.json')
+            sf = getattr(args, 'split_file', 'splits/split_seed42.json')
+            json_path = sf if os.path.isabs(sf) else os.path.join(_PROJECT_ROOT, sf)
             try:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     split_data = json.load(f)
@@ -574,7 +575,15 @@ def process(args):
 
     #Load pre-trained weights
     if args.pretrain is not None:
-        model.load_params(torch.load(args.pretrain, weights_only=False)["state_dict"])
+        ckpt_pretrain = torch.load(args.pretrain, weights_only=False)
+        sd_pretrain = ckpt_pretrain.get("state_dict", ckpt_pretrain.get("net", ckpt_pretrain))
+        if isinstance(sd_pretrain, dict):
+            if any(k.startswith('module.') for k in sd_pretrain):
+                sd_pretrain = {k[len('module.'):] if k.startswith('module.') else k: v for k, v in sd_pretrain.items()}
+            model.load_params(sd_pretrain)
+            print(f"[INFO] Loaded pretrained weights from {args.pretrain}")
+        else:
+            raise ValueError(f"Unrecognized checkpoint format in {args.pretrain}")
 
     # Load encoder-only pretrained weights (SSL or BTCV/MONAI)
     if getattr(args, "pretrain_encoder_only", None):
@@ -617,13 +626,52 @@ def process(args):
         args.case_text_store = CaseTextEmbeddingStore(args.case_text_embedding)
         print(f"[INFO] Loaded case text embeddings from: {args.case_text_embedding}")
 
+    # Finetune: load model weights BEFORE DDP wrapping so keys match (no module. prefix)
+    if getattr(args, "finetune_from", None):
+        ckpt = torch.load(args.finetune_from, map_location='cpu', weights_only=False)
+        state_dict = ckpt.get("net", None)
+        if state_dict is None:
+            state_dict = ckpt.get("state_dict", None)
+        if state_dict is None and isinstance(ckpt, dict):
+            state_dict = ckpt
+        if state_dict is None or not isinstance(state_dict, dict):
+            raise ValueError(f"Unrecognized checkpoint format in {args.finetune_from}. Expected keys: 'net' or 'state_dict', or a raw state_dict dict.")
+        # Strip module. prefix if present (from DDP-saved checkpoints)
+        if any(k.startswith('module.') for k in state_dict):
+            state_dict = {k[len('module.'):] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+        # Handle organ_embedding shape mismatch (checkpoint [2,2,512] vs model [2,512])
+        if 'organ_embedding' in state_dict and 'organ_embedding' in model.state_dict():
+            if state_dict['organ_embedding'].shape != model.organ_embedding.shape:
+                print(f"[INFO] Resizing organ_embedding: {model.organ_embedding.shape} -> {state_dict['organ_embedding'].shape}")
+                del model.organ_embedding
+                model.register_buffer('organ_embedding', state_dict['organ_embedding'].clone())
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"[INFO] Finetune: loaded weights from {args.finetune_from} (strict=False). Missing={len(missing)}, Unexpected={len(unexpected)}")
+        if missing:
+            print(f"[INFO] Missing keys (first 5): {missing[:5]}")
+        try:
+            args.epoch = int(getattr(args, "epoch", 0))
+        except Exception:
+            args.epoch = 0
+
     model.to(args.device)
     model.train()
+
+    # Resume: load model weights BEFORE DDP wrapping so keys match (no module. prefix)
+    if getattr(args, 'resume', None):
+        args._resume_ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
+        sd_resume = args._resume_ckpt['net']
+        if any(k.startswith('module.') for k in sd_resume):
+            sd_resume = {k[len('module.'):] if k.startswith('module.') else k: v for k, v in sd_resume.items()}
+        missing, unexpected = model.load_state_dict(sd_resume, strict=False)
+        print(f'[INFO] Resume: loaded model weights from {args.resume} (Missing={len(missing)}, Unexpected={len(unexpected)})')
+        args.epoch = args._resume_ckpt.get('epoch', 0)
 
     # DDP wrapping (after model.to(device), before optimizer creation)
     if distributed:
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
         print(f"[DDP] Model wrapped with DistributedDataParallel")
 
     # Optional EMA/SWA models (evaluation/saving only)
@@ -644,35 +692,6 @@ def process(args):
         for p in args.swa_model.parameters():
             p.requires_grad_(False)
         print(f"[INFO] SWA enabled (start_epoch={args.swa_start}, update_every={args.swa_update_every})")
-
-    # Finetune: load model weights only, reset optimizer/scheduler/epoch
-    if getattr(args, "finetune_from", None):
-        ckpt = torch.load(args.finetune_from, map_location=args.device, weights_only=False)
-        state_dict = ckpt.get("net", None)
-        if state_dict is None:
-            state_dict = ckpt.get("state_dict", None)
-        if state_dict is None and isinstance(ckpt, dict):
-            # allow passing a raw state_dict
-            state_dict = ckpt
-        if state_dict is None or not isinstance(state_dict, dict):
-            raise ValueError(f"Unrecognized checkpoint format in {args.finetune_from}. Expected keys: 'net' or 'state_dict', or a raw state_dict dict.")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"[INFO] Finetune: loaded weights from {args.finetune_from} (strict=False). Missing={len(missing)}, Unexpected={len(unexpected)}")
-        # restart training from scratch unless user explicitly sets --epoch
-        try:
-            args.epoch = int(getattr(args, "epoch", 0))
-        except Exception:
-            args.epoch = 0
-
-        # If EMA/SWA enabled, re-init them from the loaded weights
-        base_model_for_resume = model.module if distributed else model
-        if getattr(args, "ema_model", None) is not None:
-            args.ema_model.load_state_dict(base_model_for_resume.state_dict(), strict=False)
-        if getattr(args, "swa_model", None) is not None:
-            args.swa_model = args.swa_model.__class__(base_model_for_resume).to(args.device)
-            args.swa_model.eval()
-            for p in args.swa_model.parameters():
-                p.requires_grad_(False)
 
     # Initialize loss functions based on loss_type
     if args.loss_type == 'dicece':
@@ -707,22 +726,24 @@ def process(args):
     else:
         print(f"[INFO] Fixed LR mode enabled: lr={optimizer.param_groups[0]['lr']}")
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, weights_only=False)
-        model.load_state_dict(checkpoint['net'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        args.epoch = checkpoint['epoch']
-        if scheduler is not None and 'scheduler' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        print('success resume from ', args.resume)
+    if getattr(args, '_resume_ckpt', None) is not None:
+        optimizer.load_state_dict(args._resume_ckpt['optimizer'])
+        if scheduler is not None and 'scheduler' in args._resume_ckpt:
+            scheduler.load_state_dict(args._resume_ckpt['scheduler'])
+        print(f'[INFO] Resume: optimizer/scheduler restored, starting from epoch {args.epoch}')
+        del args._resume_ckpt
 
     torch.backends.cudnn.benchmark = True
 
-    # Default drop list for bone_tumor dataset
-    DEFAULT_DROP_LIST = ['11687281', '12298737', '10180747', '11232743', '11744770', '11084154', '11768711']
+    # Default drop list for bone_tumor dataset (aligned with split_seed42.json)
+    DEFAULT_DROP_LIST = ['11687281', '12298737']
     drop_list = getattr(args, 'drop_list', None)
     if drop_list is None and args.dataset == 'bone_tumor':
         drop_list = DEFAULT_DROP_LIST
+
+    # Default split file for bone_tumor: use fixed split_seed42.json (reference split)
+    if getattr(args, 'fold', None) is None and getattr(args, 'split_file', None) is None and args.dataset == 'bone_tumor':
+        args.split_file = 'splits/split_seed42.json'
 
     # train loader
     if args.dataset == 'data1':
@@ -746,6 +767,9 @@ def process(args):
                     persistent=True,
                     num_workers=args.num_workers,
                     random_seed=args.seed,
+                    drop_list=drop_list,
+                    fold=getattr(args, 'fold', None),
+                    split_file=getattr(args, 'split_file', None),
                     distributed=distributed,
                 )
                 train_loader_mr = None
@@ -757,6 +781,9 @@ def process(args):
                     persistent=True,
                     num_workers=0,
                     random_seed=args.seed,
+                    drop_list=drop_list,
+                    fold=getattr(args, 'fold', None),
+                    split_file=getattr(args, 'split_file', None),
                     distributed=distributed,
                 )
                 print(f"[INFO] Cross-attention mode: Using paired CT+MR loader")
@@ -839,6 +866,23 @@ def process(args):
 
     args.log_dir = str_tmp if args.rank == 0 else None
 
+    # Terminal log (rank 0 only): tee stdout to terminal_log.txt in experiment dir
+    if args.rank == 0 and str_tmp is not None:
+        os.makedirs(str_tmp, exist_ok=True)
+        term_log_path = os.path.join(str_tmp, 'terminal_log.txt')
+        class _Tee:
+            def __init__(self, fpath):
+                self.file = open(fpath, 'w', buffering=1)
+                self.stdout = sys.stdout
+            def write(self, msg):
+                self.stdout.write(msg)
+                self.file.write(msg)
+            def flush(self):
+                self.stdout.flush()
+                self.file.flush()
+        sys.stdout = _Tee(term_log_path)
+        print(f"[INFO] Terminal log: {term_log_path}")
+
     best_dice = 0.0
     best_epoch = 0
 
@@ -880,8 +924,10 @@ def process(args):
             writer.add_scalar('route_weight_expert0', w0, args.epoch)
             writer.add_scalar('route_weight_expert1', w1, args.epoch)
 
-        # Validation
-        if args.dataset == 'bone_tumor':
+        # Validation (skip before val_start_epoch to save time)
+        val_start = getattr(args, 'val_start_epoch', 0)
+        if args.dataset == 'bone_tumor' and args.epoch >= val_start:
+            eval_mode = str(getattr(args, 'eval_mode', 'full')).lower()
             # Always write metrics + training_curves; heavy case vis gated inside enhanced_validation
             if args.rank == 0:
                 vis_output_dir = args.log_dir
@@ -922,26 +968,30 @@ def process(args):
 
             current_val_dice = val_metrics['foreground_dice_mean']
             print(f'\n[Epoch {args.epoch}] Current validation Dice (foreground): {current_val_dice:.8f}')
-            print(f'[Epoch {args.epoch}] Precision: {val_metrics["precision_mean"]:.4f}, Recall: {val_metrics["recall_mean"]:.4f}, IoU: {val_metrics["iou_mean"]:.4f}')
+            if eval_mode == 'full':
+                print(f'[Epoch {args.epoch}] Precision: {val_metrics["precision_mean"]:.4f}, Recall: {val_metrics["recall_mean"]:.4f}, IoU: {val_metrics["iou_mean"]:.4f}')
+            else:
+                print(f'[Epoch {args.epoch}] Eval mode: dice-only')
             print(f'[Epoch {args.epoch}] Bucketed Dice - <2%: {val_metrics["bucket_lt2_dice"]:.4f}, 2-5%: {val_metrics["bucket_2to5_dice"]:.4f}, >5%: {val_metrics["bucket_gt5_dice"]:.4f}')
             print(f'[Epoch {args.epoch}] Best validation Dice so far: {best_dice:.8f} (at epoch {best_epoch})')
 
             if args.rank == 0:
                 writer.add_scalar('val_dice_foreground', current_val_dice, args.epoch)
-                writer.add_scalar('val_precision', val_metrics['precision_mean'], args.epoch)
-                writer.add_scalar('val_recall', val_metrics['recall_mean'], args.epoch)
-                writer.add_scalar('val_iou', val_metrics['iou_mean'], args.epoch)
-                writer.add_scalar('val_iou_std', val_metrics['iou_std'], args.epoch)
-                writer.add_scalar('val_voxel_iou', val_metrics['voxel_iou'], args.epoch)
                 writer.add_scalar('val_dice_lt2', val_metrics['bucket_lt2_dice'], args.epoch)
                 writer.add_scalar('val_dice_2to5', val_metrics['bucket_2to5_dice'], args.epoch)
                 writer.add_scalar('val_dice_gt5', val_metrics['bucket_gt5_dice'], args.epoch)
-                if np.isfinite(val_metrics.get('hd95_mean', float('nan'))):
-                    writer.add_scalar('val_hd95', val_metrics['hd95_mean'], args.epoch)
-                    writer.add_scalar('val_hd95_std', val_metrics['hd95_std'], args.epoch)
-                if np.isfinite(val_metrics.get('assd_mean', float('nan'))):
-                    writer.add_scalar('val_assd', val_metrics['assd_mean'], args.epoch)
-                    writer.add_scalar('val_assd_std', val_metrics['assd_std'], args.epoch)
+                if eval_mode == 'full':
+                    writer.add_scalar('val_precision', val_metrics['precision_mean'], args.epoch)
+                    writer.add_scalar('val_recall', val_metrics['recall_mean'], args.epoch)
+                    writer.add_scalar('val_iou', val_metrics['iou_mean'], args.epoch)
+                    writer.add_scalar('val_iou_std', val_metrics['iou_std'], args.epoch)
+                    writer.add_scalar('val_voxel_iou', val_metrics['voxel_iou'], args.epoch)
+                    if np.isfinite(val_metrics.get('hd95_mean', float('nan'))):
+                        writer.add_scalar('val_hd95', val_metrics['hd95_mean'], args.epoch)
+                        writer.add_scalar('val_hd95_std', val_metrics['hd95_std'], args.epoch)
+                    if np.isfinite(val_metrics.get('assd_mean', float('nan'))):
+                        writer.add_scalar('val_assd', val_metrics['assd_mean'], args.epoch)
+                        writer.add_scalar('val_assd_std', val_metrics['assd_std'], args.epoch)
                 writer.add_scalar('Route_CE', avg_route_ce, args.epoch)
 
                 if current_val_dice > best_dice:
@@ -972,14 +1022,16 @@ def process(args):
                     metrics_log_path = os.path.join(str_tmp, 'best_model_metrics.txt')
                     with open(metrics_log_path, 'w') as f:
                         f.write(f"[Best Model Validation Metrics - Epoch {args.epoch}]\n")
+                        f.write(f"  Eval Mode: {eval_mode}\n")
                         f.write(f"  Foreground Dice: {val_metrics['foreground_dice_mean']:.4f} ± {val_metrics['foreground_dice_std']:.4f}\n")
-                        f.write(f"  Precision: {val_metrics['precision_mean']:.4f}\n")
-                        f.write(f"  Recall: {val_metrics['recall_mean']:.4f}\n")
-                        f.write(f"  IoU (non-empty GT): {val_metrics['iou_mean']:.4f} ± {val_metrics['iou_std']:.4f}\n")
-                        f.write(f"  Voxel IoU @0.5: {val_metrics['voxel_iou']:.4f}\n")
-                        if np.isfinite(val_metrics.get('hd95_mean', float('nan'))):
-                            f.write(f"  HD95 (mm): {val_metrics['hd95_mean']:.4f} ± {val_metrics['hd95_std']:.4f}\n")
-                            f.write(f"  ASSD (mm): {val_metrics['assd_mean']:.4f} ± {val_metrics['assd_std']:.4f}\n")
+                        if eval_mode == 'full':
+                            f.write(f"  Precision: {val_metrics['precision_mean']:.4f}\n")
+                            f.write(f"  Recall: {val_metrics['recall_mean']:.4f}\n")
+                            f.write(f"  IoU (non-empty GT): {val_metrics['iou_mean']:.4f} ± {val_metrics['iou_std']:.4f}\n")
+                            f.write(f"  Voxel IoU @0.5: {val_metrics['voxel_iou']:.4f}\n")
+                            if np.isfinite(val_metrics.get('hd95_mean', float('nan'))):
+                                f.write(f"  HD95 (mm): {val_metrics['hd95_mean']:.4f} ± {val_metrics['hd95_std']:.4f}\n")
+                                f.write(f"  ASSD (mm): {val_metrics['assd_mean']:.4f} ± {val_metrics['assd_std']:.4f}\n")
                         f.write(f"\n[Bucketed Dice by GT Positive Ratio]\n")
                         f.write(f"  <2%:   {val_metrics['bucket_lt2_dice']:.4f} (n={val_metrics['bucket_lt2_count']})\n")
                         f.write(f"  2-5%:  {val_metrics['bucket_2to5_dice']:.4f} (n={val_metrics['bucket_2to5_count']})\n")
@@ -1019,6 +1071,7 @@ def process(args):
             with open(final_log_path, 'w') as f:
                 f.write(f"[Training Summary]\n")
                 f.write(f"  Loss Type: {args.loss_type}\n")
+                f.write(f"  Eval Mode: {args.eval_mode}\n")
                 if args.loss_type != 'dicece':
                     f.write(f"  Loss Parameters: alpha={args.loss_alpha}, beta={args.loss_beta}, gamma={args.loss_gamma}\n")
                 f.write(f"  Max Epochs: {args.max_epoch}\n")
@@ -1074,6 +1127,8 @@ def main():
                         help='Weight for boundary-band Dice loss (0=disabled). Used in train_mix.')
     parser.add_argument('--boundary_kernel', type=int, default=3,
                         help='Odd kernel size for 3D morphological boundary band (default 3).')
+    parser.add_argument('--boundary_start_epoch', type=int, default=140,
+                        help='Epoch at which boundary_dice_loss starts being applied (default 140).')
     parser.add_argument('--weight_decay', default=1e-5, type=float, help='Weight Decay')
     parser.add_argument('--dataset', default='data1', type=str, choices=['data1', 'bone_tumor'], help='Dataset to use: data1 (original) or bone_tumor')
     parser.add_argument('--data_root_path', default='./dataset/data1', help='data root path')
@@ -1097,6 +1152,9 @@ def main():
     parser.add_argument('--loss_alpha', type=float, default=0.7, help='Tversky alpha parameter (FP weight)')
     parser.add_argument('--loss_beta', type=float, default=0.3, help='Tversky beta parameter (FN weight)')
     parser.add_argument('--loss_gamma', type=float, default=1.33, help='Focal gamma parameter')
+    parser.add_argument('--eval_mode', type=str, default='dice', choices=['full', 'dice'],
+                        help='Validation mode: "full" computes all metrics/visualizations, '
+                             '"dice" only computes Dice-based validation and bucketed Dice.')
     parser.add_argument('--pos_neg_ratio', type=float, default=None, help='Positive to negative patch ratio (e.g., 3.0 for 3:1)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
 
@@ -1110,6 +1168,12 @@ def main():
                              'all=freeze stages 1-4, stage4=freeze 1-3 thaw 4, '
                              'stage34=freeze 1-2 thaw 3-4, none=full fine-tune.')
     # =======================================================
+
+    # ======== Validation control ========
+    parser.add_argument('--val_start_epoch', type=int, default=100,
+                        help='First epoch at which validation runs. Set >0 to skip early validation '
+                             '(e.g., 100 to skip first 100 epochs, saving ~2min/epoch).')
+    # =================================
 
     # ======== Fold-based data split ========
     parser.add_argument('--fold', type=int, default=None,

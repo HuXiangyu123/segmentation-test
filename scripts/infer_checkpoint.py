@@ -205,7 +205,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='0', help='GPU device')
-    parser.add_argument('--fold', type=int, default=0, help='Fold index (0-4), default=0')
+    parser.add_argument('--fold', type=int, default=-1, help='Fold index (0-4), -1 for fixed-split (no fold)')
     parser.add_argument('--split_file', type=str, default='splits/fold5_splits.json', help='Split file path')
     parser.add_argument('--output_json', type=str, default=None, help='Save results to JSON')
     args = parser.parse_args()
@@ -227,6 +227,8 @@ def main():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'MulModSeg_2024'))
     from dataloader_bone_tumor import get_loader_bone_tumor, get_loader_paired_bone_tumor
 
+    fold = None if args.fold < 0 else args.fold
+
     paired = args.train_modality == 'MIX'
     if paired:
         val_loader = get_loader_paired_bone_tumor(
@@ -234,7 +236,7 @@ def main():
             phase='val',
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            fold=args.fold,
+            fold=fold,
             split_file=args.split_file,
             drop_list=drop_list,
             distributed=False,
@@ -246,7 +248,7 @@ def main():
             phase='val',
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            fold=args.fold,
+            fold=fold,
             split_file=args.split_file,
             drop_list=drop_list,
             distributed=False,
@@ -267,7 +269,7 @@ def main():
             phase='val',
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            fold=args.fold,
+            fold=fold,
             split_file=args.split_file,
             drop_list=drop_list,
             distributed=False,

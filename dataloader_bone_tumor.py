@@ -286,8 +286,20 @@ def get_paired_data_dicts(root_dir: str, phase: str = 'train',
 
     patient_ids = sorted(patient_data.keys())
 
-    # Fold-based or ratio-based split
-    if fold is not None and split_file is not None:
+    # Split strategy: fixed split > fold-based > ratio-based
+    if split_file is not None and fold is None:
+        # Fixed split: JSON with 'train'/'val' keys at top level (e.g., split_seed42.json)
+        with open(split_file, 'r', encoding='utf-8') as f:
+            split_data = json.load(f)
+        if 'train' in split_data and 'val' in split_data:
+            selected_ids = set()
+            for item in split_data[phase]:
+                selected_ids.add(item.split('/')[-1])
+            selected = [pid for pid in patient_ids if pid in selected_ids]
+            print(f"[Paired Split] Fixed split ({split_file}), {phase}: {len(selected)} patients")
+        else:
+            raise ValueError(f"Fixed split file {split_file} must contain 'train' and 'val' keys.")
+    elif fold is not None and split_file is not None:
         with open(split_file, 'r', encoding='utf-8') as f:
             split_data = json.load(f)
         fold_key = f'fold{fold}'
@@ -419,9 +431,30 @@ def get_bone_tumor_data_dict(root_dir: str, modality: str = 'CT', phase: str = '
                 del patient_data[pid]
                 print(f"[INFO] Dropped patient: {pid}")
 
-    # Fold-based split or ratio-based split
-    if fold is not None:
-        # Load from split file
+    # Split strategy: fixed split > fold-based > ratio-based
+    if split_file is not None and fold is None:
+        # Fixed split: JSON with 'train'/'val' keys at top level (e.g., split_seed42.json)
+        if not os.path.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+
+        with open(split_file, 'r') as f:
+            split_data = json.load(f)
+
+        if 'train' in split_data and 'val' in split_data:
+            if phase not in split_data:
+                raise ValueError(f"Phase '{phase}' not found in {split_file}. Available: train, val")
+            selected_ids = set()
+            for item in split_data[phase]:
+                if '/' in item:
+                    selected_ids.add(item.split('/')[-1])
+                else:
+                    selected_ids.add(item)
+            selected_patient_ids = [pid for pid in patient_data.keys() if pid in selected_ids]
+            print(f"[Bone Tumor Split] Fixed split ({split_file}), {phase}: {len(selected_patient_ids)} patients")
+        else:
+            raise ValueError(f"Fixed split file {split_file} must contain 'train' and 'val' keys.")
+    elif fold is not None:
+        # Load from fold-based split file
         if split_file is None:
             split_file = os.path.join(os.path.dirname(os.path.dirname(root_dir)), 'splits', 'fold5_splits.json')
         if not os.path.exists(split_file):

@@ -71,7 +71,8 @@ These are fundamentally different: bottleneck uses dense attention (O(n²)), ski
 ### Training
 
 ```bash
-# Main model: MulModSeg + cross-attention + SSL pretrained
+# Default config: MIX modality, dice-only validation starting at epoch 100
+# (eval_mode=dice and val_start_epoch=100 are now the built-in defaults)
 torchrun --nproc_per_node=2 MulModSeg_2024/train.py \
     --distributed \
     --dataset bone_tumor --data_root_path ./dataset \
@@ -80,10 +81,10 @@ torchrun --nproc_per_node=2 MulModSeg_2024/train.py \
     --use_cross_attention \
     --pretrain_encoder_only ./MulModSeg_2024/pretrained/ssl_pretrained_weights.pth \
     --freeze_level all \
-    --max_epoch 150 --train_modality MIX \
-    --batch_size 1 --num_samples 3 --roi_x 96 --roi_y 96 --roi_z 96 \
+    --max_epoch 150 --batch_size 1 --num_samples 3 \
+    --roi_x 96 --roi_y 96 --roi_z 96 \
     --lr 1e-4 --loss_type dicece \
-    --log_name M2b_mulmodseg_crossattn_freeze_all
+    --log_name mix_exp
 ```
 
 ### Inference
@@ -96,20 +97,120 @@ python scripts/infer_checkpoint.py \
     --device 0
 ```
 
-## Key Arguments
+## Train Entry
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--backbone` | `swinunetr` | Encoder backbone: `swinunetr`, `unet` |
-| `--with_text_embedding` | `1` | `1` = MulModSeg (MoE head), `0` = plain backbone |
-| `--use_cross_attention` | `false` | **Must pass explicitly** to enable CT↔MR fusion |
-| `--cross_attn_heads` | `8` | Number of attention heads for cross-attention |
-| `--pretrain_encoder_only` | `None` | Path to SSL/BTCV pretrained encoder weights |
+### Core Parameter Choices
+
+| Argument | Default | Choices / Meaning |
+|----------|---------|-------------------|
+| `--device` | `0` | Single-GPU device id `0-7` |
+| `--distributed` | `false` | Enable DDP via `torchrun` |
+| `--dataset` | `data1` | `data1`, `bone_tumor` |
+| `--data_root_path` | `./dataset/data1` | Dataset root path |
+| `--backbone` | `swinunetr` | `swinunetr`, `unet`, `dints`, `unetpp` |
+| `--train_modality` | `MIX` | `CT`, `MR`, `MIX` |
+| `--with_text_embedding` | `1` | `1` = MulModSeg (text-guided MoE), `0` = plain backbone |
+| `--use_cross_attention` | `false` | Must pass explicitly for paired CT↔MR bottleneck fusion |
+| `--cross_attn_heads` | `8` | Number of cross-attention heads |
+| `--trans_encoding` | `word_embedding` | `word_embedding`, `rand_embedding` |
+| `--word_embedding` | `./text_embedding/bone_tumor_class_embeddings.pth` | Static text embedding file |
+| `--case_text_embedding` | `None` | Per-case text embedding `.pth` |
+| `--use_case_text_embedding` | `false` | Fuse case-level text embedding with static tumor text |
+| `--case_text_alpha` | `0.3` | Fusion weight for case text |
+| `--pretrain` | `None` | Full checkpoint preload |
+| `--pretrain_encoder_only` | `None` | Encoder-only pretrained weights |
 | `--freeze_level` | `none` | `all`, `stage4`, `stage34`, `none` |
-| `--train_modality` | `MIX` | `CT`, `MR`, `MIX` (paired CT+MR) |
-| `--word_embedding` | `text_embedding/bone_tumor_class_embeddings.pth` | Static text embeddings [2,2,512] |
-| `--case_text_embedding` | `None` | Per-case LLM caption embeddings |
-| `--entropy_weight` | `0.01` | MoE routing entropy regularization |
+| `--resume` | `None` | Resume full training state |
+| `--finetune_from` | `None` | Load weights only, reset optimizer/scheduler |
+| `--use_ema` | `false` | Evaluate/save EMA-smoothed weights |
+| `--use_swa` | `false` | Evaluate/save SWA weights |
+| `--max_epoch` | `1000` | Training epochs |
+| `--warmup_epoch` | `10` | Warmup epochs |
+| `--lr` | `1e-4` | Learning rate |
+| `--fixed_lr` | `false` | Disable cosine scheduler and keep fixed LR |
+| `--weight_decay` | `1e-5` | Optimizer weight decay |
+| `--batch_size` | `1` | Batch size |
+| `--num_workers` | `8` | DataLoader workers |
+| `--roi_x --roi_y --roi_z` | `96 96 96` | Training / validation crop size |
+| `--num_samples` | `2` | Number of random samples per scan during training |
+| `--loss_type` | `dicece` | `dicece`, `tversky`, `focal_tversky` |
+| `--loss_alpha` | `0.7` | Tversky / focal-Tversky alpha |
+| `--loss_beta` | `0.3` | Tversky / focal-Tversky beta |
+| `--loss_gamma` | `1.33` | Focal-Tversky gamma |
+| `--boundary_loss_weight` | `0.0` | Enable boundary-band Dice auxiliary loss |
+| `--boundary_kernel` | `3` | Boundary band kernel size |
+| `--boundary_start_epoch` | `140` | First epoch applying boundary loss |
+| `--entropy_weight` | `0.01` | MoE routing regularization weight |
+| `--pos_neg_ratio` | `None` | Optional positive/negative patch sampling ratio |
+| `--fold` | `None` | Fold index `0-4` for `splits/fold5_splits.json` |
+| `--split_file` | `None` | Custom split JSON path |
+| `--drop_list` | `None` | Patient ids to exclude |
+| `--seed` | `42` | Random seed |
+
+### Evaluation Parameters
+
+| Argument | Default | Meaning |
+|----------|---------|---------|
+| `--eval_mode` | `dice` | `full` = Dice + Precision/Recall/IoU + HD95/ASSD + PR/ROC + visualizations; `dice` = only foreground Dice and bucketed Dice (default, saves ~95% val time) |
+| `--val_start_epoch` | `100` | First epoch that actually runs validation. Saves ~2.5min per skipped epoch. Set to `0` for full monitoring |
+
+## Eval Methods
+
+### `--eval_mode full`
+
+Use this when you need the full validation package:
+
+- foreground Dice / IoU / Precision / Recall / F1
+- HD95 / ASSD
+- PR-AUC / ROC-AUC
+- metrics CSV and training curves
+- best / worst case visualizations
+
+### `--eval_mode dice`
+
+Use this when validation cost is the bottleneck and you only care about segmentation selection by Dice.
+
+It keeps:
+
+- `foreground_dice_mean`
+- `foreground_dice_std`
+- bucketed Dice by GT positive ratio: `<2%`, `2-5%`, `>5%`
+- best-model selection by foreground Dice
+
+It skips:
+
+- Precision / Recall / IoU
+- HD95 / ASSD
+- PR / ROC
+- heavy best/worst case visualization dumps
+
+This mode is the recommended default for long dual-modality runs when early-epoch validation is mostly noise.
+
+### Recommended Dual-Modality Example
+
+```bash
+torchrun --nproc_per_node=2 MulModSeg_2024/train.py \
+    --distributed \
+    --dataset bone_tumor --data_root_path ./dataset \
+    --backbone swinunetr \
+    --train_modality MIX \
+    --with_text_embedding 1 \
+    --use_cross_attention \
+    --pretrain_encoder_only ./MulModSeg_2024/pretrained/ssl_pretrained_weights.pth \
+    --freeze_level all \
+    --batch_size 1 --num_samples 3 \
+    --roi_x 96 --roi_y 96 --roi_z 96 \
+    --max_epoch 150 --warmup_epoch 10 \
+    --lr 1e-4 --loss_type dicece \
+    --log_name mix_crossattn
+```
+
+Recommended use case:
+
+- `--train_modality MIX`: paired CT+MR training
+- `--use_cross_attention`: enable CT↔MR fusion
+- `--eval_mode dice` (default): keep validation cheap — Dice only, no HD95/ASSD/PR-ROC/vis
+- `--val_start_epoch 100` (default): delay validation until the model has left the unstable early phase
 
 ## Experiment Structure
 

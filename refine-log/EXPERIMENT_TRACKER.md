@@ -1,9 +1,10 @@
 # Experiment Tracker
 
 **Last Updated**: 2026-04-30
-**Total GPU Budget**: ~64h (must-run) to 100h (complete)
-**Hardware**: 2× RTX 3090, all experiments use `torchrun --nproc_per_node=2`
-**Training Config**: batch_size=1/GPU, roi_size=96³, num_samples=3, lr=1e-4, effective batch=6
+**Total GPU Budget**: ~64h (must-run) to ~97h (complete)
+**Hardware**: 2× RTX 3090, all experiments use `torchrun --nproc_per_node=2` (no single GPU)
+**Training Config**: batch_size=1/GPU, roi_size=96³, num_samples=2-3, lr=1e-4, effective batch=4-6
+**Default**: Single train/val split (80/20). 5-fold CV only when `--fold` is explicitly set.
 
 ---
 
@@ -26,7 +27,7 @@
 
 | Exp ID | Variant | Status | Start | End | GPU-h | Dice (fg) | Dice (pelvis) | Seed Var | Notes |
 |--------|---------|--------|-------|-----|-------|-----------|---------------|----------|-------|
-| M0_boundary_dice | boundary_dice_weight=0.3 | ⬜ | — | — | — | — | — | — | Config only |
+| M0_boundary_dice | boundary_dice_weight=0.3, start_epoch=140 | ⬜ | — | — | — | — | — | — | Config only, boundary at ep140 |
 | M0_modality_routing | modality_embedding=true | ⬜ | — | — | — | — | — | — | +10 lines MulModSeg.py |
 | M0_pelvis_sample | pelvis_weight=2.0 | ⬜ | — | — | — | — | — | — | dataloader change |
 | M0_decoder_se | SE in decoder path | ⬜ | — | — | — | — | — | — | attention_plugins.py |
@@ -58,6 +59,12 @@
 | M2b_freeze_s34 | Freeze 1-2, thaw 3-4 | ⬜ | — | — | — | — | — | — | |
 | M2b_full_finetune | No freeze | ⬜ | — | — | — | — | — | — | |
 | M2b_no_pretrain | No pretrained weights | ⬜ | — | — | — | — | — | — | |
+
+## M2b+MulModSeg: Freeze + Full Model
+
+| Exp ID | Config | Status | Start | End | GPU-h | Dice (fg) | Dice (pelvis) | Precision | Notes |
+|--------|--------|--------|-------|-----|-------|-----------|---------------|-----------|-------|
+| M2b_freeze_s4_mulmodseg | freeze_s4 + cross_attn + text, 200ep | 🔄 | 04-30 | — | — | — | — | — | boundary_dice at ep140 |
 
 ## M2c: Combined
 

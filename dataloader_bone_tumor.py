@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ from monai.transforms import (
 )
 
 from monai.data import DataLoader, CacheDataset, PersistentDataset, list_data_collate, MetaTensor
-from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import Dataset as TorchDataset, DistributedSampler
 
 
 def _detect_zero_edges_by_contagion(slice_data: np.ndarray) -> np.ndarray:
@@ -207,7 +208,10 @@ def get_paired_ct_mr_data_dict(root_dir: str, phase: str = 'train',
 #为了分别处理 CT 和 MR
 
 def get_paired_data_dicts(root_dir: str, phase: str = 'train',
-                          train_ratio: float = 0.8, random_seed: int = 42) -> List[Dict]:
+                          train_ratio: float = 0.8, random_seed: int = 42,
+                          drop_list: Optional[List[str]] = None,
+                          fold: Optional[int] = None,
+                          split_file: Optional[str] = None) -> List[Dict]:
     """
     获取配对的CT+MR数据字典（合并格式），用于联合增强。
 
@@ -274,17 +278,47 @@ def get_paired_data_dicts(root_dir: str, phase: str = 'train',
                     'name': patient_id,
                 }
 
-    patient_ids = sorted(patient_data.keys())
-    random.seed(random_seed)
-    random.shuffle(patient_ids)
+    # Apply drop list
+    if drop_list:
+        for drop_id in drop_list:
+            drop_key = drop_id.split('/')[-1] if '/' in drop_id else drop_id
+            patient_data.pop(drop_key, None)
 
-    split_idx = int(len(patient_ids) * train_ratio)
-    if phase == 'train':
-        selected = patient_ids[:split_idx]
-    elif phase == 'val':
-        selected = patient_ids[split_idx:]
+    patient_ids = sorted(patient_data.keys())
+
+    # Split strategy: fixed split > fold-based > ratio-based
+    if split_file is not None and fold is None:
+        # Fixed split: JSON with 'train'/'val' keys at top level (e.g., split_seed42.json)
+        with open(split_file, 'r', encoding='utf-8') as f:
+            split_data = json.load(f)
+        if 'train' in split_data and 'val' in split_data:
+            selected_ids = set()
+            for item in split_data[phase]:
+                selected_ids.add(item.split('/')[-1])
+            selected = [pid for pid in patient_ids if pid in selected_ids]
+            print(f"[Paired Split] Fixed split ({split_file}), {phase}: {len(selected)} patients")
+        else:
+            raise ValueError(f"Fixed split file {split_file} must contain 'train' and 'val' keys.")
+    elif fold is not None and split_file is not None:
+        with open(split_file, 'r', encoding='utf-8') as f:
+            split_data = json.load(f)
+        fold_key = f'fold{fold}'
+        fold_data = split_data['folds'][fold_key]
+        selected_ids = set()
+        for item in fold_data[phase]:
+            selected_ids.add(item.split('/')[-1])
+        selected = [pid for pid in patient_ids if pid in selected_ids]
+        print(f"[Paired Split] Fold {fold}, {phase}: {len(selected)} patients (from split file)")
     else:
-        raise ValueError(f"Unknown phase: {phase}")
+        random.seed(random_seed)
+        random.shuffle(patient_ids)
+        split_idx = int(len(patient_ids) * train_ratio)
+        if phase == 'train':
+            selected = patient_ids[:split_idx]
+        elif phase == 'val':
+            selected = patient_ids[split_idx:]
+        else:
+            raise ValueError(f"Unknown phase: {phase}")
 
     data_list = [patient_data[pid] for pid in selected]
     print(f"[Paired Data] {phase.upper()} - {len(data_list)} paired CT+MR cases")
@@ -292,7 +326,10 @@ def get_paired_data_dicts(root_dir: str, phase: str = 'train',
 #为了联合处理 CT 和 MR 数据
 
 def get_bone_tumor_data_dict(root_dir: str, modality: str = 'CT', phase: str = 'train',
-                              train_ratio: float = 0.8, random_seed: int = 42) -> List[Dict]:
+                              train_ratio: float = 0.8, random_seed: int = 42,
+                              drop_list: Optional[List[str]] = None,
+                              fold: Optional[int] = None,
+                              split_file: Optional[str] = None) -> List[Dict]:
     """
     获取bone tumor数据集的数据字典
 
@@ -310,9 +347,12 @@ def get_bone_tumor_data_dict(root_dir: str, modality: str = 'CT', phase: str = '
     Args:
         root_dir: 数据集根目录
         modality: 'CT', 'MR', 或 'MIX'
-        phase: 'train' 或 'val'
-        train_ratio: 训练集比例
-        random_seed: 随机种子
+        phase: 'train', 'val', 或 'test'
+        train_ratio: 训练集比例（仅在 fold=None 时使用）
+        random_seed: 随机种子（仅在 fold=None 时使用）
+        drop_list: 需要排除的患者ID列表（可选）
+        fold: 5-fold 索引 (0-4)，指定时从 split_file 加载（可选）
+        split_file: 5-fold split 文件路径（默认 splits/fold5_splits.json）
 
     Returns:
         数据字典列表，每个元素包含 'image', 'label', 'modality', 'name'
@@ -384,19 +424,81 @@ def get_bone_tumor_data_dict(root_dir: str, modality: str = 'CT', phase: str = '
     if len(patient_data) == 0:
         raise ValueError(f"No data found in {root_dir} for modality {modality}")
 
-    # 患者级切分
-    patient_ids = sorted(patient_data.keys())
-    random.seed(random_seed)
-    random.shuffle(patient_ids)
+    # Apply drop_list filter
+    if drop_list:
+        for pid in drop_list:
+            if pid in patient_data:
+                del patient_data[pid]
+                print(f"[INFO] Dropped patient: {pid}")
 
-    split_idx = int(len(patient_ids) * train_ratio)
+    # Split strategy: fixed split > fold-based > ratio-based
+    if split_file is not None and fold is None:
+        # Fixed split: JSON with 'train'/'val' keys at top level (e.g., split_seed42.json)
+        if not os.path.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
 
-    if phase == 'train':
-        selected_patient_ids = patient_ids[:split_idx]
-    elif phase == 'val':
-        selected_patient_ids = patient_ids[split_idx:]
+        with open(split_file, 'r') as f:
+            split_data = json.load(f)
+
+        if 'train' in split_data and 'val' in split_data:
+            if phase not in split_data:
+                raise ValueError(f"Phase '{phase}' not found in {split_file}. Available: train, val")
+            selected_ids = set()
+            for item in split_data[phase]:
+                if '/' in item:
+                    selected_ids.add(item.split('/')[-1])
+                else:
+                    selected_ids.add(item)
+            selected_patient_ids = [pid for pid in patient_data.keys() if pid in selected_ids]
+            print(f"[Bone Tumor Split] Fixed split ({split_file}), {phase}: {len(selected_patient_ids)} patients")
+        else:
+            raise ValueError(f"Fixed split file {split_file} must contain 'train' and 'val' keys.")
+    elif fold is not None:
+        # Load from fold-based split file
+        if split_file is None:
+            split_file = os.path.join(os.path.dirname(os.path.dirname(root_dir)), 'splits', 'fold5_splits.json')
+        if not os.path.exists(split_file):
+            # Try relative to working directory
+            split_file = 'splits/fold5_splits.json'
+        if not os.path.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+
+        with open(split_file, 'r') as f:
+            split_data = json.load(f)
+
+        fold_key = f'fold{fold}'
+        if fold_key not in split_data['folds']:
+            raise ValueError(f"Fold {fold} not found in {split_file}. Available: {list(split_data['folds'].keys())}")
+
+        fold_data = split_data['folds'][fold_key]
+        if phase not in fold_data:
+            raise ValueError(f"Phase '{phase}' not found in fold {fold}. Available: {list(fold_data.keys())}")
+
+        # split file stores IDs like "第1批/11084154" or just "11687281"
+        selected_ids = set()
+        for item in fold_data[phase]:
+            if '/' in item:
+                # "第1批/11084154" -> patient_id = "11084154"
+                selected_ids.add(item.split('/')[-1])
+            else:
+                selected_ids.add(item)
+
+        selected_patient_ids = [pid for pid in patient_data.keys() if pid in selected_ids]
+        print(f"[Bone Tumor Split] Fold {fold}, {phase}: {len(selected_patient_ids)} patients (from split file)")
     else:
-        raise ValueError(f"Unknown phase: {phase}")
+        # Default ratio-based split (80/20)
+        patient_ids = sorted(patient_data.keys())
+        random.seed(random_seed)
+        random.shuffle(patient_ids)
+
+        split_idx = int(len(patient_ids) * train_ratio)
+
+        if phase == 'train':
+            selected_patient_ids = patient_ids[:split_idx]
+        elif phase == 'val':
+            selected_patient_ids = patient_ids[split_idx:]
+        else:
+            raise ValueError(f"Unknown phase: {phase}")
 
     data_list = []
     for patient_id in selected_patient_ids:
@@ -460,7 +562,11 @@ def get_loader_bone_tumor(root_dir: str,
                           random_seed: int = 42,
                           persistent: bool = True,
                           cache_dir: str = "",
-                          num_workers: int = 8):
+                          num_workers: int = 8,
+                          drop_list: Optional[List[str]] = None,
+                          fold: Optional[int] = None,
+                          split_file: Optional[str] = None,
+                          distributed: bool = False):
     """
     创建bone tumor数据集的DataLoader
 
@@ -622,7 +728,10 @@ def get_loader_bone_tumor(root_dir: str,
         modality=modality,
         phase=phase,
         train_ratio=train_ratio,
-        random_seed=random_seed
+        random_seed=random_seed,
+        drop_list=drop_list,
+        fold=fold,
+        split_file=split_file,
     )
 
     print(f"[Bone Tumor Dataset] {phase.upper()} - Modality: {modality}, Samples: {len(data_dicts)}")
@@ -781,15 +890,27 @@ def get_loader_bone_tumor(root_dir: str,
             )
 
     # 创建DataLoader
-    shuffle = (phase == 'train')
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers if phase == 'train' else 0,
-        collate_fn=list_data_collate,
-        pin_memory=True
-    )
+    if distributed:
+        sampler = DistributedSampler(dataset, shuffle=(phase == 'train'))
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers if phase == 'train' else 0,
+            collate_fn=list_data_collate,
+            pin_memory=True,
+            drop_last=(phase == 'train'),
+        )
+    else:
+        shuffle = (phase == 'train')
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers if phase == 'train' else 0,
+            collate_fn=list_data_collate,
+            pin_memory=True
+        )
 
     return loader
 #非配对数据增强
@@ -803,7 +924,11 @@ def get_loader_paired_bone_tumor(root_dir: str,
                                   random_seed: int = 42,
                                   persistent: bool = True,
                                   cache_dir: str = "",
-                                  num_workers: int = 8):
+                                  num_workers: int = 8,
+                                  distributed: bool = False,
+                                  drop_list: Optional[List[str]] = None,
+                                  fold: Optional[int] = None,
+                                  split_file: Optional[str] = None):
     """
     创建配对 CT+MR 的 DataLoader，空间增强严格同步。
 
@@ -922,6 +1047,9 @@ def get_loader_paired_bone_tumor(root_dir: str,
         phase=phase,
         train_ratio=train_ratio,
         random_seed=random_seed,
+        drop_list=drop_list,
+        fold=fold,
+        split_file=split_file,
     )
 
     print(f"[Paired Loader] {phase.upper()} - {len(data_dicts)} cases, roi={roi_size}, "
@@ -963,14 +1091,26 @@ def get_loader_paired_bone_tumor(root_dir: str,
         full_transforms = Compose([cache_transforms, aug_transforms])
         dataset = CacheDataset(data=data_dicts, transform=full_transforms, cache_rate=1.0)
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(phase == 'train'),
-        num_workers=num_workers if phase == 'train' else 0,
-        collate_fn=list_data_collate,
-        pin_memory=True,
-    )
+    if distributed:
+        sampler = DistributedSampler(dataset, shuffle=(phase == 'train'))
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers if phase == 'train' else 0,
+            collate_fn=list_data_collate,
+            pin_memory=True,
+            drop_last=(phase == 'train'),
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(phase == 'train'),
+            num_workers=num_workers if phase == 'train' else 0,
+            collate_fn=list_data_collate,
+            pin_memory=True,
+        )
     return loader
 #配对数据增强的transform获取函数（可选，提供更灵活的接口）
 

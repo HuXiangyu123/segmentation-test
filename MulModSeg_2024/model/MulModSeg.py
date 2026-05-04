@@ -1,5 +1,5 @@
 import math
-from typing import Sequence, Tuple, Type, Union, Optional
+from typing import Sequence, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -57,20 +57,7 @@ class BidirectionalCrossAttention3D(nn.Module):
         fused = self.fusion(torch.cat([ct_enhanced, mr_enhanced], dim=1))
         return ct_enhanced, mr_enhanced, fused
 
-class GatedSkipFusion3D(nn.Module):
-    """Fuse CT/MR skip features with a learnable channel-wise gate."""
-    def __init__(self, channels: int):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Conv3d(channels * 2, channels, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
 
-    def forward(self, ct_feat: torch.Tensor, mr_feat: torch.Tensor):
-        ct_ctx = F.adaptive_avg_pool3d(ct_feat, output_size=1)
-        mr_ctx = F.adaptive_avg_pool3d(mr_feat, output_size=1)
-        alpha = self.gate(torch.cat([ct_ctx, mr_ctx], dim=1))
-        return alpha * ct_feat + (1.0 - alpha) * mr_feat
 
 # ==========================================
 # 2. 核心动态模块：TDWB + SFM (含偏置专家与残差调制)
@@ -161,10 +148,9 @@ class MulModSeg(nn.Module):
             self.cross_attention = BidirectionalCrossAttention3D(dim=cross_attn_dim, num_heads=cross_attn_heads)
             self.cross_attn_proj = nn.Identity() if cross_attn_dim == dec4_dim else nn.Conv3d(cross_attn_dim, dec4_dim, 1)
             self.decoder_fusion = nn.Sequential(
-                nn.Conv3d(decoder_out_dim * 2, decoder_out_dim, 1), 
+                nn.Conv3d(decoder_out_dim * 2, decoder_out_dim, 1),
                 nn.LeakyReLU(0.1, inplace=True)
             )
-            self.skip_fusion = nn.ModuleDict({k: GatedSkipFusion3D(v) for k, v in self.skip_dims.items()})
 
         # 文本特征对齐层
         if encoding == 'word_embedding':
@@ -201,13 +187,6 @@ class MulModSeg(nn.Module):
         
         return F.leaky_relu(self.text_to_vision(fused), negative_slope=0.1)
 
-    def _fuse_skip(self, name: str, ct_feat: Optional[torch.Tensor], mr_feat: Optional[torch.Tensor]):
-        if ct_feat is None:
-            return mr_feat
-        if mr_feat is None:
-            return ct_feat
-        return self.skip_fusion[name](ct_feat, mr_feat)
-
     def forward(self, x_in, modality, x_in_mr=None, case_text_embedding=None):
         b = x_in.shape[0]
         
@@ -228,22 +207,17 @@ class MulModSeg(nn.Module):
         #     _, out_ct = self.backbone(x_in)
         #     out = out_ct
         if x_in_mr is not None and self.use_cross_attention:
-            # 1. CT/MR 都提取 dec4 + skip（Ablation 1：双路 skip 融合）
-            ct_enc0, ct_enc1, ct_enc2, ct_enc3, dec4_ct, ct_hid3 = self.backbone.forward_to_dec4(x_in, return_skips=True)
-            mr_enc0, mr_enc1, mr_enc2, mr_enc3, dec4_mr, mr_hid3 = self.backbone.forward_to_dec4(x_in_mr, return_skips=True)
-            
+            # 1. CT 仅提取深层特征 (关闭 return_skips)
+            dec4_ct = self.backbone.forward_to_dec4(x_in, return_skips=False)
+
+            # 2. MR 提取深层特征 + 所有浅层跳跃连接 (开启 return_skips)
+            enc0, enc1, enc2, enc3, dec4_mr, hid3 = self.backbone.forward_to_dec4(x_in_mr, return_skips=True)
+
             # 3. 跨模态注意力融合
             _, _, fused_dec4 = self.cross_attention(dec4_ct, dec4_mr)
             fused_dec4 = self.cross_attn_proj(fused_dec4)
 
-            # 4. 浅层 skip 融合（逐层可学习门控）
-            enc0 = self._fuse_skip("enc0", ct_enc0, mr_enc0)
-            enc1 = self._fuse_skip("enc1", ct_enc1, mr_enc1)
-            enc2 = self._fuse_skip("enc2", ct_enc2, mr_enc2)
-            enc3 = self._fuse_skip("enc3", ct_enc3, mr_enc3) if "enc3" in self.skip_fusion else self._fuse_skip("enc2", ct_enc3, mr_enc3)
-            hid3 = self._fuse_skip("hid3", ct_hid3, mr_hid3) if "hid3" in self.skip_fusion else self._fuse_skip("enc2", ct_hid3, mr_hid3)
-            
-            # 5. 单路解码：融合 dec4 + 融合 skips
+            # 4. 单路解码：融合的高级特征 + 纯 MR 的浅层特征
             out = self.backbone.forward_from_dec4(fused_dec4, enc0, enc1, enc2, enc3, hid3)
         else:
             _, out = self.backbone(x_in)

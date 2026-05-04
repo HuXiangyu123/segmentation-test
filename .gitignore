@@ -51,6 +51,7 @@ MulModSeg_2024/out/**/epoch_*.pt
 !MulModSeg_2024/out/**/final_model.pt
 *.pt
 *.pth
+
 # Temporary and test outputs
 **/smoke_test_*/
 **/test_*/
@@ -94,3 +95,8 @@ templates/
 experiment/
 vis_sort/
 MulModSeg_2024/pretrained/
+MulModSeg_2024/text_embedding/*.pth
+MulModSeg_2024/text_embedding/**/*.pth
+
+# Paper (compiled output + build artifacts)
+paper/

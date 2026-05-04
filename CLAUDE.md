@@ -51,8 +51,10 @@ python MulModSeg_2024/train.py [args]
 Use `--log_name <ExpID>` to match the experiment tracker (e.g., `--log_name M0_boundary_dice`).
 
 ### Data Split
-Use `--fold <0-4>` with `splits/fold5_splits.json` for reproducible 5-fold experiments.
-Default (no `--fold`) uses the ratio-based split from the dataloader (legacy).
+- **Default**: 80/20 train/val ratio-based split (seed=42). No `--fold` needed.
+- **5-fold CV** (optional): `--fold <0-4>` loads from `splits/fold5_splits.json`.
+- **Drop list**: 7 patients excluded by default (see `refine-log/bad_samples.json`). Override with `--drop_list <ids>`.
+- Main model and comparison experiments: **do not use `--fold`**.
 
 ### GPU Assignment
 - GPU 0: odd-numbered experiments

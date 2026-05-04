@@ -759,20 +759,23 @@ def plot_validation_summary(metrics, curve_data, epoch, output_dir):
     print(f"[Visualization] Saved validation summary to: {fig_path}")
 
 
-def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=None, lr=None):
+def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=None, lr=None, best_dice=None):
     """
     Enhanced validation with detailed metrics and visualization.
     """
     model.eval()
+    eval_mode = str(getattr(args, "eval_mode", "full")).lower()
+    dice_only = eval_mode == "dice"
 
     print(f"\n[Enhanced Validation] Epoch {epoch}")
     print(f"[Validation] Total batches: {len(val_loader)}")
+    print(f"[Validation] Eval mode: {eval_mode}")
 
     spacing_xyz = (float(args.space_x), float(args.space_y), float(args.space_z))
 
     case_results = []
-    prob_pos_hist = np.zeros(256, dtype=np.int64)
-    prob_neg_hist = np.zeros(256, dtype=np.int64)
+    prob_pos_hist = np.zeros(256, dtype=np.int64) if not dice_only else None
+    prob_neg_hist = np.zeros(256, dtype=np.int64) if not dice_only else None
     voxel_tp = 0.0
     voxel_fp = 0.0
     voxel_fn = 0.0
@@ -854,8 +857,6 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
                     x_ct, roi_size, 1, single_predictor_no_text, overlap=0.5
                 )
 
-            prob_map = torch.softmax(logit_map, dim=1)
-            prob_fg = prob_map[:, 1:2]
             pred_argmax = torch.argmax(logit_map, dim=1, keepdim=True)
 
             gt_binary = (y > 0.5).float()
@@ -885,21 +886,26 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
 
             gt_fg_np = gt_binary[0, 0].cpu().numpy()
             pred_fg_np = pred_binary[0, 0].cpu().numpy()
-            prob_fg_np = prob_fg[0, 0].detach().cpu().numpy()
-            case_metric = compute_binary_metrics_from_masks(pred_fg_np, gt_fg_np)
-            update_probability_histograms(prob_fg_np, gt_fg_np, prob_pos_hist, prob_neg_hist)
-            voxel_tp += case_metric["tp"]
-            voxel_fp += case_metric["fp"]
-            voxel_fn += case_metric["fn"]
-            voxel_tn += case_metric["tn"]
+            if dice_only:
+                case_metric = None
+            else:
+                prob_map = torch.softmax(logit_map, dim=1)
+                prob_fg = prob_map[:, 1:2]
+                prob_fg_np = prob_fg[0, 0].detach().cpu().numpy()
+                case_metric = compute_binary_metrics_from_masks(pred_fg_np, gt_fg_np)
+                update_probability_histograms(prob_fg_np, gt_fg_np, prob_pos_hist, prob_neg_hist)
+                voxel_tp += case_metric["tp"]
+                voxel_fp += case_metric["fp"]
+                voxel_fn += case_metric["fn"]
+                voxel_tn += case_metric["tn"]
 
             gt_positive_ratio = gt_fg_np.sum() / gt_fg_np.size
             pred_positive_ratio = pred_fg_np.sum() / pred_fg_np.size
             is_empty_gt = float(gt_positive_ratio == 0.0)
             foreground_dice = compute_foreground_case_dice(pred_binary[0, 0], gt_binary[0, 0])
-            foreground_iou = compute_foreground_case_iou(pred_binary[0, 0], gt_binary[0, 0])
+            foreground_iou = compute_foreground_case_iou(pred_binary[0, 0], gt_binary[0, 0]) if not dice_only else float("nan")
 
-            if is_empty_gt:
+            if dice_only or is_empty_gt:
                 hd95_v, assd_v = float("nan"), float("nan")
             else:
                 try:
@@ -912,19 +918,19 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
                 'case_name': case_name,
                 'foreground_dice': foreground_dice,
                 'foreground_iou': foreground_iou,
-                'precision': case_metric['precision'],
-                'recall': case_metric['recall'],
-                'f1': case_metric['f1'],
-                'case_dice_thresholded': case_metric['dice'],
+                'precision': case_metric['precision'] if case_metric is not None else float("nan"),
+                'recall': case_metric['recall'] if case_metric is not None else float("nan"),
+                'f1': case_metric['f1'] if case_metric is not None else float("nan"),
+                'case_dice_thresholded': case_metric['dice'] if case_metric is not None else foreground_dice,
                 'gt_positive_ratio': gt_positive_ratio,
                 'pred_positive_ratio': pred_positive_ratio,
                 'is_empty_gt': bool(is_empty_gt),
                 'hd95': hd95_v,
                 'assd': assd_v,
-                'image': x_vis.cpu(),
-                'mr_image': x_mr.cpu() if x_mr is not None else None,
-                'label': y.cpu(),
-                'pred': pred_argmax.cpu()
+                'image': None if dice_only else x_vis.cpu(),
+                'mr_image': None if (dice_only or x_mr is None) else x_mr.cpu(),
+                'label': None if dice_only else y.cpu(),
+                'pred': None if dice_only else pred_argmax.cpu()
             })
 
     nonempty_cases = [r for r in case_results if not r['is_empty_gt']]
@@ -938,13 +944,13 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
 
     foreground_dice_mean = np.mean(foreground_dices) if len(foreground_dices) > 0 else 0.0
     foreground_dice_std = np.std(foreground_dices) if len(foreground_dices) > 0 else 0.0
-    precision_mean = np.mean(precisions) if len(precisions) > 0 else 0.0
-    recall_mean = np.mean(recalls) if len(recalls) > 0 else 0.0
-    f1_mean = np.mean(f1_scores) if len(f1_scores) > 0 else 0.0
-    iou_mean = np.mean(ious) if len(ious) > 0 else 0.0
-    iou_std = np.std(ious) if len(ious) > 0 else 0.0
+    precision_mean = np.mean(precisions) if (not dice_only and len(precisions) > 0) else float("nan")
+    recall_mean = np.mean(recalls) if (not dice_only and len(recalls) > 0) else float("nan")
+    f1_mean = np.mean(f1_scores) if (not dice_only and len(f1_scores) > 0) else float("nan")
+    iou_mean = np.mean(ious) if (not dice_only and len(ious) > 0) else float("nan")
+    iou_std = np.std(ious) if (not dice_only and len(ious) > 0) else float("nan")
 
-    if len(nonempty_cases) > 0:
+    if not dice_only and len(nonempty_cases) > 0:
         hd95_arr = np.asarray([r["hd95"] for r in nonempty_cases], dtype=np.float64)
         assd_arr = np.asarray([r["assd"] for r in nonempty_cases], dtype=np.float64)
         hd95_mean = float(np.nanmean(hd95_arr))
@@ -957,12 +963,28 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
         assd_mean = float("nan")
         assd_std = float("nan")
 
-    voxel_precision = _safe_div(voxel_tp, voxel_tp + voxel_fp)
-    voxel_recall = _safe_div(voxel_tp, voxel_tp + voxel_fn)
-    voxel_f1 = _safe_div(2.0 * voxel_precision * voxel_recall, voxel_precision + voxel_recall + 1e-8)
-    voxel_dice = _safe_div(2.0 * voxel_tp, 2.0 * voxel_tp + voxel_fp + voxel_fn + 1e-8)
-    voxel_iou = _safe_div(voxel_tp, voxel_tp + voxel_fp + voxel_fn + 1e-8)
-    curve_data = compute_curves_from_histograms(prob_pos_hist, prob_neg_hist)
+    if dice_only:
+        voxel_precision = float("nan")
+        voxel_recall = float("nan")
+        voxel_f1 = float("nan")
+        voxel_dice = float("nan")
+        voxel_iou = float("nan")
+        curve_data = {
+            "precision": np.asarray([], dtype=np.float64),
+            "recall": np.asarray([], dtype=np.float64),
+            "pr_auc": float("nan"),
+            "fpr": np.asarray([], dtype=np.float64),
+            "tpr": np.asarray([], dtype=np.float64),
+            "roc_auc": float("nan"),
+            "prevalence": float("nan"),
+        }
+    else:
+        voxel_precision = _safe_div(voxel_tp, voxel_tp + voxel_fp)
+        voxel_recall = _safe_div(voxel_tp, voxel_tp + voxel_fn)
+        voxel_f1 = _safe_div(2.0 * voxel_precision * voxel_recall, voxel_precision + voxel_recall + 1e-8)
+        voxel_dice = _safe_div(2.0 * voxel_tp, 2.0 * voxel_tp + voxel_fp + voxel_fn + 1e-8)
+        voxel_iou = _safe_div(voxel_tp, voxel_tp + voxel_fp + voxel_fn + 1e-8)
+        curve_data = compute_curves_from_histograms(prob_pos_hist, prob_neg_hist)
 
     bucket_lt2 = [r['foreground_dice'] for r in nonempty_cases if 0.0 < r['gt_positive_ratio'] < 0.02]
     bucket_2to5 = [r['foreground_dice'] for r in nonempty_cases if 0.02 <= r['gt_positive_ratio'] <= 0.05]
@@ -989,20 +1011,23 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
     print(f"  Non-empty GT cases: {len(nonempty_cases)}")
     print(f"  Empty GT cases: {len(empty_cases)}")
     print(f"  Foreground Dice (non-empty GT only): {foreground_dice_mean:.4f} +/- {foreground_dice_std:.4f}")
-    print(f"  F1 (non-empty GT only): {f1_mean:.4f}")
-    print(f"  Precision (non-empty GT only): {precision_mean:.4f}")
-    print(f"  Recall (non-empty GT only): {recall_mean:.4f}")
-    print(f"  IoU / Jaccard (non-empty GT only): {iou_mean:.4f} +/- {iou_std:.4f}")
-    if np.isfinite(hd95_mean):
-        print(f"  HD95 (non-empty GT, mm): {hd95_mean:.4f} +/- {hd95_std:.4f}")
-        print(f"  ASSD (non-empty GT, mm): {assd_mean:.4f} +/- {assd_std:.4f}")
+    if dice_only:
+        print(f"  Dice-only mode: skipped Precision/Recall/IoU, HD95/ASSD, PR/ROC, and case visualizations")
     else:
-        print(f"  HD95 / ASSD: n/a (no non-empty GT cases)")
-    print(f"  Voxel Dice @0.5: {voxel_dice:.4f}")
-    print(f"  Voxel IoU @0.5: {voxel_iou:.4f}")
-    print(f"  Voxel F1 @0.5: {voxel_f1:.4f}")
-    print(f"  PR-AUC: {curve_data['pr_auc']:.4f}" if np.isfinite(curve_data['pr_auc']) else "  PR-AUC: nan")
-    print(f"  ROC-AUC: {curve_data['roc_auc']:.4f}" if np.isfinite(curve_data['roc_auc']) else "  ROC-AUC: nan")
+        print(f"  F1 (non-empty GT only): {f1_mean:.4f}")
+        print(f"  Precision (non-empty GT only): {precision_mean:.4f}")
+        print(f"  Recall (non-empty GT only): {recall_mean:.4f}")
+        print(f"  IoU / Jaccard (non-empty GT only): {iou_mean:.4f} +/- {iou_std:.4f}")
+        if np.isfinite(hd95_mean):
+            print(f"  HD95 (non-empty GT, mm): {hd95_mean:.4f} +/- {hd95_std:.4f}")
+            print(f"  ASSD (non-empty GT, mm): {assd_mean:.4f} +/- {assd_std:.4f}")
+        else:
+            print(f"  HD95 / ASSD: n/a (no non-empty GT cases)")
+        print(f"  Voxel Dice @0.5: {voxel_dice:.4f}")
+        print(f"  Voxel IoU @0.5: {voxel_iou:.4f}")
+        print(f"  Voxel F1 @0.5: {voxel_f1:.4f}")
+        print(f"  PR-AUC: {curve_data['pr_auc']:.4f}" if np.isfinite(curve_data['pr_auc']) else "  PR-AUC: nan")
+        print(f"  ROC-AUC: {curve_data['roc_auc']:.4f}" if np.isfinite(curve_data['roc_auc']) else "  ROC-AUC: nan")
     if len(empty_cases) > 0:
         print(f"\n[Empty-GT Case Metrics]")
         print(f"  Empty case accuracy: {empty_case_accuracy:.4f}")
@@ -1060,26 +1085,29 @@ def enhanced_validation(args, val_loader, model, epoch, output_dir=None, loss=No
             lr=lr,
         )
         plot_epoch_curves(metrics_csv, output_dir=metrics_dir)
-        plot_validation_summary(
-            {
-                'foreground_dice_mean': foreground_dice_mean,
-                'f1_mean': f1_mean,
-                'precision_mean': precision_mean,
-                'recall_mean': recall_mean,
-                'iou_mean': iou_mean,
-                'voxel_precision': voxel_precision,
-                'voxel_recall': voxel_recall,
-                'voxel_tp': voxel_tp,
-                'voxel_fp': voxel_fp,
-                'voxel_tn': voxel_tn,
-            },
-            curve_data,
-            epoch=epoch,
-            output_dir=metrics_dir,
-        )
+        # Only plot validation summary on new best (or first epoch if best_dice not provided)
+        is_new_best = (best_dice is None) or (foreground_dice_mean > best_dice)
+        if is_new_best and not dice_only:
+            plot_validation_summary(
+                {
+                    'foreground_dice_mean': foreground_dice_mean,
+                    'f1_mean': f1_mean,
+                    'precision_mean': precision_mean,
+                    'recall_mean': recall_mean,
+                    'iou_mean': iou_mean,
+                    'voxel_precision': voxel_precision,
+                    'voxel_recall': voxel_recall,
+                    'voxel_tp': voxel_tp,
+                    'voxel_fp': voxel_fp,
+                    'voxel_tn': voxel_tn,
+                },
+                curve_data,
+                epoch=epoch,
+                output_dir=metrics_dir,
+            )
 
         # ---- heavy case visualizations (every 10 epochs) ----
-        if (epoch % 10 == 0):
+        if (epoch % 10 == 0) and not dice_only:
             # 最差三个可视化
             vis_dir_worst = Path(output_dir) / f'epoch_{epoch:03d}_worst3'
             vis_dir_worst.mkdir(parents=True, exist_ok=True)
